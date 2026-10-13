@@ -5414,6 +5414,10 @@ hb_filter_object_t * hb_filter_get( int filter_id )
     hb_filter_object_t * filter;
     switch( filter_id )
     {
+        case HB_FILTER_ADAPTER:
+            filter = &hb_filter_adapter;
+            break;
+
         case HB_FILTER_DETELECINE:
             filter = &hb_filter_detelecine;
             break;
@@ -6304,6 +6308,7 @@ int hb_audio_add(const hb_job_t * job, const hb_audio_config_t * audiocfg)
     AVChannelLayout *out_ch_layout = audio->config.out.ch_layout;
     audio->config.out = audiocfg->out;
     audio->config.out.track = hb_list_count(job->list_audio) + 1;
+    audio->config.out.name = NULL;
     if (audiocfg->out.name && *audiocfg->out.name)
     {
         audio->config.out.name = strdup(audiocfg->out.name);
