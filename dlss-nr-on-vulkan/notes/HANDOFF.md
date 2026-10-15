@@ -1,6 +1,6 @@
 # HANDOFF — read this first
 
-State of the DLSS-NR on Intel Xe2 project as of **2026-10-10**. notes/CLAUDE.md holds the
+State of the DLSS-NR on Intel Xe2 project as of **2026-10-15**. notes/CLAUDE.md holds the
 original brief; **this file overrides it wherever they disagree**, and after
 2026-09-09 they disagree about something foundational.
 
@@ -8,6 +8,59 @@ original brief; **this file overrides it wherever they disagree**, and after
 you need the evidence behind a line in this file, rather than reading them in order.
 
 ---
+
+## Latest: a vector-matrix path on Direct3D 12 — `gemm_coopvec` (2026-10-15)
+
+libd3dmx had no matrix path (`phase75`: "SM 6.9's linalg is matrix-vector"). The owner asked
+for a vectored path on exactly that: a GEMM is M rows of vector times matrix, and Direct3D's
+*cooperative vector* — Shader Model 6.10's `dx/linalg.h`, a thread-scope matrix loaded from a
+buffer times a per-thread vector, `dx.op.linAlgMatVecMul` — computes it on the matrix units.
+`notes/phase77-d3d12-vector-matrix.md`; **written and cross-built on the M3, run on no device.**
+
+- **`src/gpu/d3d12/gemm_coopvec.hlsl`**: a thread owns a row of C and a 64-column slice (then
+  32, then 16), takes its row of A as a long vector 128 deep at a time (then 64, 32, 16), loads
+  the B slice as a thread-scope fp16 matrix straight off the weight buffer — row-major (K, N)
+  read column-major, a transposed B read row-major, no copy — and sums the products in fp32.
+  The same push block, flags and epilogues as `gemm_portable.hlsl`: residual (window writeback
+  included), publishes, half out, compact head, half copy, the QKV epilogue a head at a time
+  (a 64-slice may straddle Q and K). Not the pooled window residual. Four builds: plain and
+  `-DGATHER` (the window-gathered A), each with `-DRESULT16` for a device with fp16 products
+  only; 220 KB and 495 KB of DXIL, 32 multiply sites each.
+- **libd3dmx**: asks the device for Shader Model 6.10, the linear algebra tier (feature 77) and
+  the fp16 thread vector-matrix multiply with fp32 then fp16 results (feature 78) — the preview
+  SDK's declarations spelled in the file, with a static assertion on the 56-byte struct; loads
+  a **preview Agility SDK through `ID3D12SDKConfiguration1::CreateDeviceFactory`**
+  (`XMX_D3D12_SDK_PATH`, else `D3D12\D3D12Core.dll` beside the executable, else beside the
+  DLL; `XMX_D3D12_SDK=0` off), enabling the experimental shader models on the factory;
+  builds the two pipelines in `xmx_res_init`; binds B a second time as a **root SRV (t0,
+  parameter 9)** in the shader-resource state, since a thread-scope matrix loads from a
+  ByteAddressBuffer; and routes every GEMM whose slices start 128-byte aligned with a
+  16-byte stride (`coopvec_fits`, mirrored by the kernel's `main`) to it, stamped as the
+  staged family. `xmx_coopvec()` / `xmx_coopvec_calls()` on every runtime (0 on Vulkan and
+  Metal), `nr_frame_coopvec()`, `NativeFrame.coopvec`; `xmx_path()` says why not when not;
+  `XMX_PORTABLE=1` or `XMX_D3D12_COOPVEC=0` turn it off. **`xmx_portable()` stays 1** there —
+  callers name the fused twins by it, and those are the multiply-add kernels on Direct3D 12.
+- **Not bit-identical** to the multiply-add kernels (the device's summation), so with the path
+  on the fused-versus-unfused checks hold only under `XMX_PORTABLE=1`: CMake adds
+  `d3d12_portable_*` runs of those nine tests and `d3d12_test_coopvec`
+  (`src/gpu/test_coopvec.py`: every routed form against numpy within 2e-3 of the magnitude,
+  the multiply-add kernels' own distance beside it, the two paths against each other, four
+  misaligned shapes refused, the routing by `xmx_coopvec_calls()` and the profiler; exit 77
+  and "skipped" without the path). The C frame reference `nr_frame_reference_d3d12.bin` is the
+  path's own picture where it runs.
+- **Build**: CMake's `nr_dxil_sm(name profile source ...)` takes a shader model, `nr_dxil` is
+  the cs_6_2 macro; `NR_D3D12_COOPVEC` (on where `dxc --help` lists `cs_6_10`) compiles the
+  four modules. Verified here: the four builds with this dxc (1.10, `084c3a4d`), libd3dmx.c
+  and nr_frame.c under MinGW with no warnings (87 exports), the MinGW cross configure and
+  build of `dxil_shaders` and `d3dmx` (22 modules embedded, a 2.1 MB DLL), CMake on macOS.
+- **Facts for the next reader**: SM 6.9's cooperative vectors were removed from dxc
+  (`67a8e24c8`); SM 6.10 is a preview (Agility SDK 1.721-preview, `D3D12_PREVIEW_SDK_VERSION`
+  721) and needs developer mode; the D3D12 datatype enum numbers FLOAT16 as 7 and FLOAT32 as 8
+  where DXIL says 8 and 9; thread-scope K is [4, 128]; the matrix offset must be 128-byte
+  aligned and a thread-scope load takes only a read-only buffer. **Next**: the first run
+  (`test_coopvec.py`, then `ctest -R d3d12_`), the speed, the optimal weight layout
+  (`ConvertLinearAlgebraMatrix`), the fused feed-forward on the same multiply, and the
+  wave-scope matrix-matrix multiply the same header offers — the true cooperative-matrix path.
 
 ## Latest: AMD RDNA3 on the matrix path, and RADV's rounding (2026-10-12)
 

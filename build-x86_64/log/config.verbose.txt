@@ -1,0 +1,144 @@
+probe: build tuple...(pass) aarch64-apple-darwin27.0.0
+  + ./make/config.guess
+  : b'aarch64-apple-darwin27.0.0'
+find: ar...(pass) /usr/bin/ar
+  : name[0] = ar
+find: cp...(pass) /bin/cp
+  : name[0] = cp
+find: gm4...(pass) /usr/local/bin/gm4
+  : name[0] = gm4
+  : name[1] = m4
+find: mkdir...(pass) /bin/mkdir
+  : name[0] = mkdir
+find: gpatch...(pass) /usr/bin/patch
+  : name[0] = gpatch
+  : name[1] = patch
+find: rm...(pass) /bin/rm
+  : name[0] = rm
+find: ranlib...(pass) /usr/bin/ranlib
+  : name[0] = ranlib
+find: strip...(pass) /usr/bin/strip
+  : name[0] = strip
+find: gtar...(pass) /usr/local/bin/tar
+  : name[0] = gtar
+  : name[1] = tar
+find: python3...(pass) /Library/Frameworks/Python.framework/Versions/3.15/bin/python3
+  : name[0] = python3
+find: gcc...(pass) /usr/bin/gcc
+  : name[0] = gcc
+find: make...(pass) /usr/local/bin/make
+  : name[0] = make
+  : name[1] = gmake
+find: autoconf...(pass) /usr/local/bin/autoconf
+  : name[0] = autoconf
+find: automake...(pass) /usr/local/bin/automake
+  : name[0] = automake
+find: libtool...(pass) /usr/local/bin/libtool
+  : name[0] = libtool
+find: lipo...(pass) /usr/bin/lipo
+  : name[0] = lipo
+  : name[1] = llvm-lipo
+find: pkg-config...(pass) /usr/local/bin/pkg-config
+  : name[0] = pkg-config
+find: meson...(pass) /opt/homebrew/bin/meson
+  : name[0] = meson
+find: nasm...(pass) /usr/local/bin/nasm
+  : name[0] = nasm
+find: ninja-build...(pass) /usr/local/bin/ninja
+  : name[0] = ninja-build
+  : name[1] = ninja
+find: cargo...(pass) /Users/andyvand/.cargo/bin/cargo
+  : name[0] = cargo
+find: glslangValidator...(pass) /usr/local/bin/glslangValidator
+  : name[0] = glslangValidator
+  : name[1] = glslang
+find: xcodebuild...(pass) /usr/bin/xcodebuild
+  : name[0] = xcodebuild
+probe: checking for -Oz...(pass) end
+  + /usr/bin/gcc -Oz -S -o /dev/null -xc /dev/null > /dev/null 2>&1
+  : <NO-OUTPUT>
+compute: available architectures...(pass) arm64 x86_64 [x86_64]
+  : <NO-OUTPUT>
+probe: number of CPU cores...(pass) 8
+  : <NO-OUTPUT>
+probe: repo info...(pass) git@github.com:andyvand/HandBrake.git
+  + ./scripts/repo-info.sh .
+  : b'URL=git@github.com:andyvand/HandBrake.git'
+  : b'HASH=fa3d36ad5dd92289b3b756c552e1df7ca9fb4811'
+  : b'SHORTHASH=fa3d36ad5'
+  : b'REV=13640'
+  : b'BRANCH=master'
+  : b'REMOTE=origin'
+  : b'DATE=2026-10-15 17:12:39 +0200'
+compute: project data...(pass) HandBrake (developer)
+  : <NO-OUTPUT>
+version probe: autoconf 2.71.0...(pass) 2.73
+  + /usr/local/bin/autoconf --version
+  : b'autoconf (GNU Autoconf) 2.73'
+  : b'Copyright (C) 2026 Free Software Foundation, Inc.'
+  : b'License GPLv3+/Autoconf: GNU GPL version 3 or later'
+  : b'<https://gnu.org/licenses/gpl.html>, <https://gnu.org/licenses/exceptions.html>'
+  : b'This is free software: you are free to change and redistribute it.'
+  : b'There is NO WARRANTY, to the extent permitted by law.'
+  : b''
+  : b'Written by David J. MacKenzie and Akim Demaille.'
+version probe: automake 1.13.0...(pass) 1.19
+  + /usr/local/bin/automake --version
+  : b'automake (GNU automake) 1.19'
+  : b'Features: subsecond-mtime'
+  : b''
+  : b'Copyright (C) 2026 Free Software Foundation, Inc.'
+  : b'License GPLv2+: GNU GPL version 2 or later'
+  : b'  <https://gnu.org/licenses/gpl-2.0.html>'
+  : b'This is free software: you are free to change and redistribute it.'
+  : b'There is NO WARRANTY, to the extent permitted by law.'
+  : b''
+  : b'Written by Tom Tromey <tromey@redhat.com>'
+  : b'       and Alexandre Duret-Lutz <adl@gnu.org>.'
+version probe: pkg-config 0.27.0...(pass) 0.29.2
+  + /usr/local/bin/pkg-config --version
+  : b'0.29.2'
+version probe: meson 0.51.0...(pass) 1.12.1
+  + /opt/homebrew/bin/meson --version
+  : b'1.12.1'
+version probe: nasm 2.13.0...(pass) 3.01
+  + /usr/local/bin/nasm --version
+  : b'NASM version 3.01 compiled on Jan  8 2026'
+version probe: xcodebuild 10.3.0...(pass) 27.0
+  + /usr/bin/xcodebuild -version
+  : b'Xcode 27.0'
+  : b'Build version 27A266a'
+compute: host tuple...(pass) x86_64-apple-darwin27.0.0
+  : <NO-OUTPUT>
+probe: checking for the Metal compiler...(pass) end
+  + xcrun -sdk macosx -f metal
+  : b'/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.M6AwNu/Metal.xctoolchain/usr/bin/metal'
+probe: checking for cargo-cbuild...(pass) end
+  + command -v cargo-cbuild >/dev/null 2>&1 || /Users/andyvand/.cargo/bin/cargo install --list | grep -E "^ *cargo-cbuild$" >/dev/null 2>&1
+  : <NO-OUTPUT>
+find: cmake...(pass) /usr/local/bin/cmake
+  : name[0] = cmake
+version probe: cmake 3.16.3...(pass) 4.0.3
+  + /usr/local/bin/cmake --version
+  : b'cmake version 4.0.3'
+  : b''
+  : b'CMake suite maintained and supported by Kitware (kitware.com/cmake).'
+probe: strerror_r...(pass) 
+  + /usr/bin/gcc
+  : <NO-OUTPUT>
+probe: checking for -Wno-format-truncation...(pass) end
+  + /usr/bin/gcc -O2 -Werror -Wno-format-truncation -S -o /dev/null -xc /dev/null > /dev/null 2>&1
+  : <NO-OUTPUT>
+compute: makevar SRC/    = ..
+compute: makevar BUILD/  = .
+compute: makevar PREFIX/ = /usr/local
+compute: makevar XCODE.prefix/ = /Applications
+mkdir: build-x86_64
+chdir: build-x86_64
+write: GNUmakefile
+mkdir: project
+write: project/handbrake.m4
+write: distfile.cfg
+mkdir: log
+write: log/config.info.txt
+write: log/config.verbose.txt

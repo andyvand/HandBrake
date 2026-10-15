@@ -18,6 +18,10 @@
 
    Unlike a game's display filter an encode is offline: every frame goes
    through the network, in order, on the filter thread, and none is skipped.
+   The per-frame pixel loops around the network -- the conversions, the
+   history's release and its dilation -- run sixteen pixels at a time on
+   SSE2 and NEON (handbrake/dlssnr_simd.h), the way visualboyadvance-m's
+   port of the same filter runs them.
 
    The model weights are compiled into libdlssnr by the owner's own build of
    dlss-nr-on-vulkan (`weights/`); this file never ships them. The library is
@@ -35,6 +39,7 @@
 
 #if HB_PROJECT_FEATURE_DLSSNR
 #include <pthread.h>
+#include "handbrake/dlssnr_simd.h"
 #include "nr_frame.h"
 #include "nr_image.h"
 #include "libavformat/avformat.h"
@@ -407,28 +412,9 @@ static void dlssnr_build_params(nr_frame_params *p, const dlssnr_settings_t *s)
     }
 }
 
-/* -------------------------------------------------------------------------
- * Pixels: `save_image` and `read_png` in nr_frame_main.c
- * ---------------------------------------------------------------------- */
-
-// clip to [0, 1], then `v * 255 + 0.5` to a byte
-static inline uint8_t dlssnr_to_byte(float v)
-{
-    v = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
-    return (uint8_t)(v * 255.0f + 0.5f);
-}
-
-// `byte / 255`, a division rather than a multiply by the reciprocal, so the
-// float the network sees is the one the command gives it
-static inline float dlssnr_from_byte(unsigned v)
-{
-    return (float)(v & 0xffu) / 255.0f;
-}
-
-static inline float dlssnr_clip01(float v)
-{
-    return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
-}
+// dlssnr_to_byte, dlssnr_from_byte and dlssnr_clip01 -- `save_image` and
+// `read_png` in nr_frame_main.c -- are in handbrake/dlssnr_simd.h beside the
+// loops that run them a vector at a time.
 
 /* -------------------------------------------------------------------------
  * nr_frame_main.c's resize(): `nr_image.bilinear`, one axis at a time
@@ -679,18 +665,9 @@ static int dlssnr_prepare_mask(hb_filter_private_t *pv)
  * well as the figure.
  * ---------------------------------------------------------------------- */
 
-static inline void dlssnr_max_into(uint8_t *out, const uint8_t *in, int n)
-{
-    for (int i = 0; i < n; i++)
-    {
-        if (in[i] > out[i])
-        {
-            out[i] = in[i];
-        }
-    }
-}
-
-// a square dilation of radius r: across into `scratch`, then down back into `image`
+// A square dilation of radius r: across into `scratch`, then down back into
+// `image`, a whole row at a time so both passes run along memory, and
+// dlssnr_max_into's sixteen bytes at a time.
 static void dlssnr_dilate(uint8_t *image, uint8_t *scratch, int width, int height, int r)
 {
     for (int y = 0; y < height; y++)
@@ -729,12 +706,8 @@ static int dlssnr_release_history(hb_filter_private_t *pv)
     const size_t  pixels = (size_t)w * h;
     const float * c      = pv->colour;
     const float * b      = pv->previous;
-    double        cut    = 0.0;
+    const double  cut    = dlssnr_sum_abs_diff(c, b, pixels * 3);
 
-    for (size_t i = 0; i < pixels * 3; i++)
-    {
-        cut += fabs((double)c[i] - b[i]);
-    }
     if (pixels && cut / (double)(pixels * 3) > DLSSNR_CUT_LIMIT)
     {
         hb_deep_log(2, "dlssnr: cut at frame %d (change %.3f), history dropped",
@@ -742,27 +715,11 @@ static int dlssnr_release_history(hb_filter_private_t *pv)
         return 0;
     }
 
-    for (size_t i = 0; i < pixels; i++)
-    {
-        float m = 0.0f;
-        for (int k = 0; k < 3; k++)
-        {
-            const float d = fabsf(c[3 * i + k] - b[3 * i + k]);
-            m = d > m ? d : m;
-        }
-        pv->moved[i] = dlssnr_to_byte(m);
-    }
+    // the change at each pixel, as a byte; the largest within the radius;
+    // the colour pushed away from itself by that much
+    dlssnr_moved(c, b, pv->moved, pixels);
     dlssnr_dilate(pv->moved, pv->dilate_scratch, w, h, DLSSNR_RELEASE_RADIUS);
-
-    for (size_t i = 0; i < pixels; i++)
-    {
-        const float m = dlssnr_from_byte(pv->moved[i]);
-        for (int k = 0; k < 3; k++)
-        {
-            const float ci = c[3 * i + k];
-            pv->gate_previous[3 * i + k] = ci >= m ? ci - m : ci + m;
-        }
-    }
+    dlssnr_gate(c, pv->moved, pv->gate_previous, pixels);
     return 1;
 }
 
@@ -936,13 +893,7 @@ static int dlssnr_process(hb_filter_private_t *pv, hb_buffer_t *in, hb_buffer_t 
         const float *g = (const float *)(pv->rgb_planes[0] + (size_t)y * pv->rgb_stride);
         const float *b = (const float *)(pv->rgb_planes[1] + (size_t)y * pv->rgb_stride);
         const float *r = (const float *)(pv->rgb_planes[2] + (size_t)y * pv->rgb_stride);
-        float       *c = pv->colour + (size_t)y * w * 3;
-        for (int x = 0; x < w; x++)
-        {
-            c[3 * x + 0] = dlssnr_clip01(r[x]);
-            c[3 * x + 1] = dlssnr_clip01(g[x]);
-            c[3 * x + 2] = dlssnr_clip01(b[x]);
-        }
+        dlssnr_interleave(r, g, b, pv->colour + (size_t)y * w * 3, w);
     }
 
     if (pv->frame_count == 0)
@@ -1024,13 +975,7 @@ static int dlssnr_process(hb_filter_private_t *pv, hb_buffer_t *in, hb_buffer_t 
         float       *g = (float *)(pv->rgb_planes[0] + (size_t)y * pv->rgb_stride);
         float       *b = (float *)(pv->rgb_planes[1] + (size_t)y * pv->rgb_stride);
         float       *r = (float *)(pv->rgb_planes[2] + (size_t)y * pv->rgb_stride);
-        const float *o = pv->composed + (size_t)y * w * 3;
-        for (int x = 0; x < w; x++)
-        {
-            r[x] = dlssnr_clip01(o[3 * x + 0]);
-            g[x] = dlssnr_clip01(o[3 * x + 1]);
-            b[x] = dlssnr_clip01(o[3 * x + 2]);
-        }
+        dlssnr_deinterleave(pv->composed + (size_t)y * w * 3, r, g, b, w);
     }
     uint8_t * out_data[4];
     int       out_stride[4];

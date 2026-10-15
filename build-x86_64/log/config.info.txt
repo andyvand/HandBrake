@@ -1,0 +1,52 @@
+probe: build tuple...(pass) aarch64-apple-darwin27.0.0
+find: ar...(pass) /usr/bin/ar
+find: cp...(pass) /bin/cp
+find: gm4...(pass) /usr/local/bin/gm4
+find: mkdir...(pass) /bin/mkdir
+find: gpatch...(pass) /usr/bin/patch
+find: rm...(pass) /bin/rm
+find: ranlib...(pass) /usr/bin/ranlib
+find: strip...(pass) /usr/bin/strip
+find: gtar...(pass) /usr/local/bin/tar
+find: python3...(pass) /Library/Frameworks/Python.framework/Versions/3.15/bin/python3
+find: gcc...(pass) /usr/bin/gcc
+find: make...(pass) /usr/local/bin/make
+find: autoconf...(pass) /usr/local/bin/autoconf
+find: automake...(pass) /usr/local/bin/automake
+find: libtool...(pass) /usr/local/bin/libtool
+find: lipo...(pass) /usr/bin/lipo
+find: pkg-config...(pass) /usr/local/bin/pkg-config
+find: meson...(pass) /opt/homebrew/bin/meson
+find: nasm...(pass) /usr/local/bin/nasm
+find: ninja-build...(pass) /usr/local/bin/ninja
+find: cargo...(pass) /Users/andyvand/.cargo/bin/cargo
+find: glslangValidator...(pass) /usr/local/bin/glslangValidator
+find: xcodebuild...(pass) /usr/bin/xcodebuild
+probe: checking for -Oz...(pass) end
+compute: available architectures...(pass) arm64 x86_64 [x86_64]
+probe: number of CPU cores...(pass) 8
+probe: repo info...(pass) git@github.com:andyvand/HandBrake.git
+compute: project data...(pass) HandBrake (developer)
+version probe: autoconf 2.71.0...(pass) 2.73
+version probe: automake 1.13.0...(pass) 1.19
+version probe: pkg-config 0.27.0...(pass) 0.29.2
+version probe: meson 0.51.0...(pass) 1.12.1
+version probe: nasm 2.13.0...(pass) 3.01
+version probe: xcodebuild 10.3.0...(pass) 27.0
+compute: host tuple...(pass) x86_64-apple-darwin27.0.0
+probe: checking for the Metal compiler...(pass) end
+probe: checking for cargo-cbuild...(pass) end
+find: cmake...(pass) /usr/local/bin/cmake
+version probe: cmake 3.16.3...(pass) 4.0.3
+probe: strerror_r...(pass) 
+probe: checking for -Wno-format-truncation...(pass) end
+compute: makevar SRC/    = ..
+compute: makevar BUILD/  = .
+compute: makevar PREFIX/ = /usr/local
+compute: makevar XCODE.prefix/ = /Applications
+mkdir: build-x86_64
+chdir: build-x86_64
+write: GNUmakefile
+mkdir: project
+write: project/handbrake.m4
+write: distfile.cfg
