@@ -53,6 +53,7 @@ struct hb_work_private_s
     uint64_t samples, ibytes;
     Float64 osamplerate;
 
+    int prime_scale;
     int input_done;
 
     hb_audio_remap_t *remap;
@@ -391,7 +392,8 @@ int encCoreAudioInit(hb_work_object_t *w, hb_job_t *job, enum AAC_MODE mode)
                               kAudioConverterPrimeInfo,
                               &piSize, &primeInfo);
 
-    pv->delay = primeInfo.leadingFrames * 90000LL / pv->osamplerate;
+    pv->prime_scale = mode == AAC_MODE_HE ? 2 : 1;
+    pv->delay = primeInfo.leadingFrames * 90000LL / pv->osamplerate * pv->prime_scale;
     *w->init_delay = pv->delay;
 
     pv->list = hb_list_init();
@@ -544,8 +546,10 @@ static hb_buffer_t* Encode(hb_work_object_t *w)
 
 static void Flush(hb_work_object_t *w, hb_buffer_list_t * list)
 {
+    hb_work_private_t *pv = w->private_data;
+
     // Nothing to flush if all we got was a EOF
-    if (w->private_data->first_pts == AV_NOPTS_VALUE)
+    if (pv->first_pts == AV_NOPTS_VALUE)
     {
         return;
     }
@@ -554,6 +558,32 @@ static void Flush(hb_work_object_t *w, hb_buffer_list_t * list)
     while ((buf = Encode(w)))
     {
         hb_buffer_list_append(list, buf);
+    }
+
+    // Subtract the trailing frames duration
+    AudioConverterPrimeInfo primeInfo;
+    UInt32 piSize = sizeof(primeInfo);
+    bzero(&primeInfo, piSize);
+    AudioConverterGetProperty(pv->converter,
+                              kAudioConverterPrimeInfo,
+                              &piSize, &primeInfo);
+
+    int64_t trailingFrames = (int64_t)primeInfo.trailingFrames * 90000LL /
+                                pv->osamplerate * pv->prime_scale;
+
+    while ((buf = hb_buffer_list_tail(list)))
+    {
+        if (trailingFrames < buf->s.duration)
+        {
+            buf->s.duration -= trailingFrames;
+            break;
+        }
+        else
+        {
+            trailingFrames -= buf->s.duration;
+            buf = hb_buffer_list_rem_tail(list);
+            hb_buffer_close(&buf);
+        }
     }
 }
 
