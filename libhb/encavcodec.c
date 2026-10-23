@@ -221,7 +221,7 @@ static const char * const av1_vaapi_level_values[] =
     // "auto", "2.0", "2.1", "2.2", "2.3", "3.0", "3.1", "3.2",
         "-99", "0",   "1",   "1",   "1",   "4",   "5",   "5",
     // "3.3", "4.0", "4.1", "4.2", "4.3", "5.0", "5.1", "5.2",
-       "5",   "8",   "9",   "9",   "9",   "12",  "13",  "14"
+       "5",   "8",   "9",   "9",   "9",   "12",  "13",  "14",
     // "5.3", "6.0", "6.1", "6.2", "6.3", NULL,
        "15",  "16",  "17",  "18",  "19",  NULL
 };
@@ -1027,7 +1027,15 @@ int encavcodecInit( hb_work_object_t * w, hb_job_t * job )
     }
     else if (job->vcodec == HB_VCODEC_FFMPEG_VCE_H265 || job->vcodec == HB_VCODEC_FFMPEG_VCE_H265_10BIT)
     {
-        context->profile = AV_PROFILE_UNKNOWN;
+        if (job->vcodec == HB_VCODEC_FFMPEG_VCE_H265)
+        {
+            context->profile = AV_PROFILE_HEVC_MAIN;
+        }
+        else if (job->vcodec == HB_VCODEC_FFMPEG_VCE_H265_10BIT)
+        {
+            context->profile = AV_PROFILE_HEVC_MAIN_10;
+        }
+
         if (job->encoder_profile != NULL && *job->encoder_profile)
         {
             if (!strcasecmp(job->encoder_profile, "main")) {

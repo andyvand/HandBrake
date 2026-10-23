@@ -16,19 +16,6 @@
 
 #define OGGVORBIS_FRAME_SIZE 1024
 
-int  encvorbisInit( hb_work_object_t *, hb_job_t * );
-int  encvorbisWork( hb_work_object_t *, hb_buffer_t **, hb_buffer_t ** );
-void encvorbisClose( hb_work_object_t * );
-
-hb_work_object_t hb_encvorbis =
-{
-    WORK_ENCVORBIS,
-    "Vorbis encoder (libvorbis)",
-    encvorbisInit,
-    encvorbisWork,
-    encvorbisClose
-};
-
 struct hb_work_private_s
 {
     float     *buf;
@@ -41,6 +28,7 @@ struct hb_work_private_s
 
     unsigned  input_samples;
     uint64_t  pts;
+    int64_t   first_pts;
     int64_t   prev_blocksize;
     int       out_discrete_channels;
 
@@ -57,6 +45,8 @@ int encvorbisInit(hb_work_object_t *w, hb_job_t *job)
     }
     hb_audio_t *audio = w->audio;
     w->private_data = pv;
+
+    pv->first_pts = AV_NOPTS_VALUE;
 
     hb_log("encvorbis: opening libvorbis");
 
@@ -142,11 +132,6 @@ int encvorbisInit(hb_work_object_t *w, hb_job_t *job)
     return 0;
 }
 
-/***********************************************************************
- * Close
- ***********************************************************************
- *
- **********************************************************************/
 void encvorbisClose(hb_work_object_t * w)
 {
     hb_work_private_t *pv = w->private_data;
@@ -166,17 +151,8 @@ void encvorbisClose(hb_work_object_t * w)
     w->private_data = NULL;
 }
 
-/***********************************************************************
- * Flush
- ***********************************************************************
- *
- **********************************************************************/
-static hb_buffer_t * Flush( hb_work_object_t * w )
+static hb_buffer_t * receive(hb_work_private_t *pv)
 {
-    hb_work_private_t * pv = w->private_data;
-    hb_buffer_t * buf;
-    int64_t     blocksize = 0;
-
     if( vorbis_analysis_blockout( &pv->vd, &pv->vb ) == 1 )
     {
         ogg_packet op;
@@ -186,15 +162,17 @@ static hb_buffer_t * Flush( hb_work_object_t * w )
 
         if( vorbis_bitrate_flushpacket( &pv->vd, &op ) )
         {
-            buf = hb_buffer_init( op.bytes );
+            hb_buffer_t *buf = hb_buffer_init( op.bytes );
             memcpy( buf->data, op.packet, op.bytes );
-            blocksize = vorbis_packet_blocksize(&pv->vi, &op);
+            int64_t blocksize = vorbis_packet_blocksize(&pv->vi, &op);
 
             buf->s.type = AUDIO_BUF;
             buf->s.frametype = HB_FRAME_AUDIO;
 
-            buf->s.start = (int64_t)(vorbis_granule_time(&pv->vd, op.granulepos) * 90000);
-            buf->s.stop  = (int64_t)(vorbis_granule_time(&pv->vd, (pv->prev_blocksize + blocksize)/4 + op.granulepos) * 90000);
+            // Granule positions count samples from the first sample sent to
+            // the encoder, so offset them by that sample's timestamp
+            buf->s.start = pv->first_pts + (int64_t)(vorbis_granule_time(&pv->vd, op.granulepos) * 90000);
+            buf->s.stop  = pv->first_pts + (int64_t)(vorbis_granule_time(&pv->vd, (pv->prev_blocksize + blocksize)/4 + op.granulepos) * 90000);
             buf->s.duration = buf->s.stop - buf->s.start;
             /* The stop time isn't accurate for the first ~3 packets, as the actual blocksize depends on the previous _and_ current packets. */
             pv->prev_blocksize = blocksize;
@@ -205,20 +183,38 @@ static hb_buffer_t * Flush( hb_work_object_t * w )
     return NULL;
 }
 
-/***********************************************************************
- * Encode
- ***********************************************************************
- *
- **********************************************************************/
-static hb_buffer_t* Encode(hb_work_object_t *w)
+/* Read nsamples interleaved samples from the input list and hand them
+ * to libvorbis. nsamples must not exceed OGGVORBIS_FRAME_SIZE. */
+static void send(hb_work_private_t *pv, int nsamples)
 {
-    hb_work_private_t *pv = w->private_data;
-    hb_buffer_t *buf;
     float **buffer;
-    int i, j;
+
+    hb_list_getbytes(pv->list, (uint8_t *)pv->buf,
+                     nsamples * pv->out_discrete_channels * sizeof(float),
+                     &pv->pts, NULL);
+    if (pv->first_pts == AV_NOPTS_VALUE)
+    {
+        pv->first_pts = pv->pts;
+    }
+    buffer = vorbis_analysis_buffer(&pv->vd, nsamples);
+    for (int i = 0; i < nsamples; i++)
+    {
+        for (int j = 0; j < pv->out_discrete_channels; j++)
+        {
+            buffer[j][i] = ((float*)pv->buf)[(pv->out_discrete_channels * i +
+                                              pv->remap_table[j])];
+        }
+    }
+
+    vorbis_analysis_wrote(&pv->vd, nsamples);
+}
+
+static hb_buffer_t * encode(hb_work_private_t *pv)
+{
+    hb_buffer_t *buf;
 
     /* Try to extract more data */
-    if ((buf = Flush(w)) != NULL)
+    if ((buf = receive(pv)) != NULL)
     {
         return buf;
     }
@@ -230,29 +226,40 @@ static hb_buffer_t* Encode(hb_work_object_t *w)
     }
 
     /* Process more samples */
-    hb_list_getbytes(pv->list, (uint8_t *)pv->buf, pv->input_samples * sizeof(float),
-                     &pv->pts, NULL);
-    buffer = vorbis_analysis_buffer(&pv->vd, OGGVORBIS_FRAME_SIZE);
-    for (i = 0; i < OGGVORBIS_FRAME_SIZE; i++)
-    {
-        for (j = 0; j < pv->out_discrete_channels; j++)
-        {
-            buffer[j][i] = ((float*)pv->buf)[(pv->out_discrete_channels * i +
-                                              pv->remap_table[j])];
-        }
-    }
-
-    vorbis_analysis_wrote(&pv->vd, OGGVORBIS_FRAME_SIZE);
+    send(pv, OGGVORBIS_FRAME_SIZE);
 
     /* Try to extract again */
-    return Flush(w);
+    return receive(pv);
 }
 
-/***********************************************************************
- * Work
- ***********************************************************************
- *
- **********************************************************************/
+/* Encode the samples left over at EOF (less than a full frame), signal
+ * the end of the stream to libvorbis and collect the remaining packets. */
+static void flush(hb_work_private_t *pv, hb_buffer_list_t *list)
+{
+    hb_buffer_t *buf;
+
+    while ((buf = encode(pv)) != NULL)
+    {
+        hb_buffer_list_append(list, buf);
+    }
+
+    int nsamples = hb_list_bytes(pv->list) /
+               (pv->out_discrete_channels * sizeof(float));
+    if (nsamples > 0)
+    {
+        send(pv, nsamples);
+    }
+
+    /* A zero-length write marks the end of the stream, which makes
+     * libvorbis release the blocks it still holds for analysis */
+    vorbis_analysis_wrote(&pv->vd, 0);
+
+    while ((buf = receive(pv)) != NULL)
+    {
+        hb_buffer_list_append(list, buf);
+    }
+}
+
 int encvorbisWork( hb_work_object_t * w, hb_buffer_t ** buf_in,
                    hb_buffer_t ** buf_out )
 {
@@ -265,20 +272,32 @@ int encvorbisWork( hb_work_object_t * w, hb_buffer_t ** buf_in,
     hb_buffer_list_clear(&list);
     if (in->s.flags & HB_BUF_FLAG_EOF)
     {
-        /* EOF on input - send it downstream & say we're done */
-        *buf_out = in;
+        /* EOF on input - flush the encoder, then send the EOF
+         * downstream & say we're done */
+        flush(pv, &list);
+        hb_buffer_list_append(&list, in);
+        *buf_out = hb_buffer_list_clear(&list);
         return HB_WORK_DONE;
     }
 
     hb_list_add(pv->list, in);
 
-    buf = Encode( w );
+    buf = encode(pv);
     while (buf)
     {
         hb_buffer_list_append(&list, buf);
-        buf = Encode( w );
+        buf = encode(pv);
     }
 
     *buf_out = hb_buffer_list_clear(&list);
     return HB_WORK_OK;
 }
+
+hb_work_object_t hb_encvorbis =
+{
+    WORK_ENCVORBIS,
+    "Vorbis encoder (libvorbis)",
+    encvorbisInit,
+    encvorbisWork,
+    encvorbisClose
+};
