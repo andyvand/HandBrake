@@ -44,7 +44,19 @@
    The per-frame pixel loops around the network -- the conversions, the
    history's release and its dilation -- run sixteen pixels at a time on
    SSE2 and NEON (handbrake/dlssnr_simd.h), the way visualboyadvance-m's
-   port of the same filter runs them.
+   port of the same filter runs them, and a band of rows at a time on
+   libdlssnr's own row pool (nr_parallel_rows), the pool its resize,
+   features and composition run on, the way VBA-M's RowPool spreads that
+   filter's sweeps of the frame. Each sweep reads the frame as few times as
+   it can: the cut measure and the change at each pixel come out of one
+   sweep, the repeat check out of the conversion that reads the pixels
+   anyway, and a head the network field holds at the frame's own width is
+   read where it lies rather than cropped out.
+
+   Every stage of a frame is timed, and the encode's means go to the log at
+   close (VBA-M's NR_APPLY_MS): the network is far from the only cost at
+   full size, and which stage is paying for a slow encode cannot be told
+   from outside.
 
    The model weights are compiled into libdlssnr by the owner's own build of
    dlss-nr-on-vulkan (`weights/`); this file never ships them. The library is
@@ -69,6 +81,7 @@
 #include "libavcodec/avcodec.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
+#include "libavutil/time.h"
 #endif
 
 // nr_frame_main.c's PROFILES, by index
@@ -111,6 +124,19 @@ typedef struct
     int32_t * high;
     float   * weight;
 } dlssnr_plan_t;
+
+// Microseconds spent in each stage over the encode, for the line at close.
+typedef struct
+{
+    int64_t convert_in;   // the pipeline's pixels to interleaved float RGB
+    int64_t release;      // the history's release
+    int64_t down;         // the colour to the network's extent (scaled only)
+    int64_t features;     // nr_frame_features_masked()
+    int64_t network;      // nr_frame_run_features()
+    int64_t up;           // the head cropped, and up to the frame's extent (scaled only)
+    int64_t compose;      // nr_frame_compose_neural()
+    int64_t convert_out;  // the composition back to the pipeline's pixels
+} dlssnr_phases_t;
 #endif
 
 struct hb_filter_private_s
@@ -131,6 +157,7 @@ struct hb_filter_private_s
     int                 scaled;         // the two extents differ
     int                 network_width;
     int                 network_height;
+    int                 crop;           // the network field is wider than the filter extent
 
     // the frame as swscale sees it: planar float RGB (GBRPF32)
     struct SwsContext * to_rgb;
@@ -147,9 +174,11 @@ struct hb_filter_private_s
     float             * gate_previous; // what the composition reads as `previous`
     float             * features;      // (network_height, network_width, 16)
     float             * wide;          // the head at the network's extent
-    float             * head;          // the head cropped to the frame
+    float             * head;          // the head at the frame's extent, when `wide` is not it as it lies
     uint8_t           * moved;         // per-pixel change, dilated
     uint8_t           * dilate_scratch;
+    double            * row_sums;      // the cut measure, a row at a time
+    uint8_t           * row_same;      // the repeat check, a row at a time
     int                 have_history;
 
     // the network's extent, when it is not the frame's: the colour brought
@@ -175,6 +204,7 @@ struct hb_filter_private_s
     int                 have_result;
     int                 repeats;       // frames that did
 
+    dlssnr_phases_t     phases;        // where the time went, for the line at close
     int                 frame_count;
     int                 acquired;      // this instance holds a reference to the model
     int                 failed;        // a pass failed: frames pass through, said once
@@ -788,49 +818,159 @@ static int dlssnr_prepare_mask(hb_filter_private_t *pv)
  * well as the figure.
  * ---------------------------------------------------------------------- */
 
-// A square dilation of radius r: across into `scratch`, then down back into
-// `image`, a whole row at a time so both passes run along memory, and
-// dlssnr_max_into's sixteen bytes at a time.
-static void dlssnr_dilate(uint8_t *image, uint8_t *scratch, int width, int height, int r)
+/* The sweeps of the frame, a band of rows at a time on libdlssnr's row pool
+ * (nr_parallel_rows): the pool its own resize, features and composition run
+ * on, so the filter's sweeps run on the threads the library's do, the way
+ * visualboyadvance-m's RowPool spreads that filter's. A band writes only its
+ * own rows and reads nothing another band writes, so the bytes are the ones
+ * the single-threaded loops made -- the one exception the cut measure, a sum
+ * of doubles added in another order, which its one consumer, a threshold,
+ * cannot tell. The pool hands out four rows at a time to whichever thread is
+ * free, and runs the sweep on the calling thread alone when it is busy. */
+
+typedef struct
 {
-    for (int y = 0; y < height; y++)
+    hb_filter_private_t * pv;
+    int                   compare;   // dlssnr_rows_to_colour: the repeat check as well
+} dlssnr_band_t;
+
+// The change at each pixel since the frame before, as a byte, and the cut
+// measure's share of each row: one sweep over the two frames rather than two.
+static void dlssnr_rows_moved(const void *args, size_t y0, size_t y1)
+{
+    hb_filter_private_t *pv = ((const dlssnr_band_t *)args)->pv;
+    const size_t         w  = (size_t)pv->width;
+
+    for (size_t y = y0; y < y1; y++)
     {
-        const uint8_t *row = image   + (size_t)y * width;
-        uint8_t       *out = scratch + (size_t)y * width;
-        memcpy(out, row, (size_t)width);
-        for (int o = 1; o <= r; o++)
+        const float *c = pv->colour   + y * w * 3;
+        const float *b = pv->previous + y * w * 3;
+        pv->row_sums[y] = dlssnr_sum_abs_diff(c, b, w * 3);
+        dlssnr_moved(c, b, pv->moved + y * w, w);
+    }
+}
+
+// The dilation's first half: the largest change within the radius across
+// each row, into `dilate_scratch`, dlssnr_max_into's sixteen bytes at a time.
+static void dlssnr_rows_dilate_across(const void *args, size_t y0, size_t y1)
+{
+    hb_filter_private_t *pv = ((const dlssnr_band_t *)args)->pv;
+    const int            w  = pv->width;
+
+    for (size_t y = y0; y < y1; y++)
+    {
+        const uint8_t *row = pv->moved          + y * w;
+        uint8_t       *out = pv->dilate_scratch + y * w;
+        memcpy(out, row, (size_t)w);
+        for (int o = 1; o <= DLSSNR_RELEASE_RADIUS; o++)
         {
-            if (width - o <= 0)
+            if (w - o <= 0)
             {
                 break;
             }
-            dlssnr_max_into(out, row + o, width - o);
-            dlssnr_max_into(out + o, row, width - o);
+            dlssnr_max_into(out, row + o, w - o);
+            dlssnr_max_into(out + o, row, w - o);
         }
     }
-    for (int y = 0; y < height; y++)
+}
+
+// The second half, down the columns back into `moved` -- then, while the
+// row is at hand, the colour pushed away from itself by that much: the
+// composition's stand-in for `previous`.
+static void dlssnr_rows_dilate_down(const void *args, size_t y0, size_t y1)
+{
+    hb_filter_private_t *pv = ((const dlssnr_band_t *)args)->pv;
+    const int            w  = pv->width;
+    const int            h  = pv->height;
+
+    for (size_t y = y0; y < y1; y++)
     {
-        uint8_t  *out = image + (size_t)y * width;
-        const int y0  = y - r < 0 ? 0 : y - r;
-        const int y1  = y + r > height - 1 ? height - 1 : y + r;
-        memcpy(out, scratch + (size_t)y0 * width, (size_t)width);
-        for (int q = y0 + 1; q <= y1; q++)
+        uint8_t  *out = pv->moved + y * w;
+        const int ya  = (int)y - DLSSNR_RELEASE_RADIUS < 0 ? 0 : (int)y - DLSSNR_RELEASE_RADIUS;
+        const int yb  = (int)y + DLSSNR_RELEASE_RADIUS > h - 1 ? h - 1 : (int)y + DLSSNR_RELEASE_RADIUS;
+        memcpy(out, pv->dilate_scratch + (size_t)ya * w, (size_t)w);
+        for (int q = ya + 1; q <= yb; q++)
         {
-            dlssnr_max_into(out, scratch + (size_t)q * width, width);
+            dlssnr_max_into(out, pv->dilate_scratch + (size_t)q * w, w);
         }
+        dlssnr_gate(pv->colour + y * w * 3, out, pv->gate_previous + y * w * 3, (size_t)w);
+    }
+}
+
+// swscale's planar float RGB as libdlssnr's interleaved RGB in [0, 1] -- and,
+// asked to, whether each row is the row of the frame before, for the repeat
+// check, while the pixels are being read anyway.
+static void dlssnr_rows_to_colour(const void *args, size_t y0, size_t y1)
+{
+    const dlssnr_band_t *band = args;
+    hb_filter_private_t *pv   = band->pv;
+    const size_t         w    = (size_t)pv->width;
+
+    for (size_t y = y0; y < y1; y++)
+    {
+        const float *g   = (const float *)(pv->rgb_planes[0] + y * pv->rgb_stride);
+        const float *b   = (const float *)(pv->rgb_planes[1] + y * pv->rgb_stride);
+        const float *r   = (const float *)(pv->rgb_planes[2] + y * pv->rgb_stride);
+        float       *out = pv->colour + y * w * 3;
+        dlssnr_interleave(r, g, b, out, (int)w);
+        if (band->compare)
+        {
+            pv->row_same[y] = memcmp(out, pv->previous + y * w * 3,
+                                     w * 3 * sizeof(float)) == 0;
+        }
+    }
+}
+
+// the composition back into swscale's planes
+static void dlssnr_rows_from_composed(const void *args, size_t y0, size_t y1)
+{
+    hb_filter_private_t *pv = ((const dlssnr_band_t *)args)->pv;
+    const size_t         w  = (size_t)pv->width;
+
+    for (size_t y = y0; y < y1; y++)
+    {
+        float *g = (float *)(pv->rgb_planes[0] + y * pv->rgb_stride);
+        float *b = (float *)(pv->rgb_planes[1] + y * pv->rgb_stride);
+        float *r = (float *)(pv->rgb_planes[2] + y * pv->rgb_stride);
+        dlssnr_deinterleave(pv->composed + y * w * 3, r, g, b, (int)w);
+    }
+}
+
+// geometry.crop(head): the first filter_width columns of each of the field's
+// rows, when the field is wider than the filter extent
+typedef struct
+{
+    const float * wide;
+    float       * cropped;
+    int           wide_width;
+    int           width;
+} dlssnr_crop_t;
+
+static void dlssnr_rows_crop(const void *args, size_t y0, size_t y1)
+{
+    const dlssnr_crop_t *c = args;
+
+    for (size_t y = y0; y < y1; y++)
+    {
+        memcpy(c->cropped + y * c->width * 4, c->wide + y * c->wide_width * 4,
+               (size_t)c->width * 4 * sizeof(float));
     }
 }
 
 // returns 1 when the history is usable this frame, 0 when it is dropped
 static int dlssnr_release_history(hb_filter_private_t *pv)
 {
-    const int     w      = pv->width;
-    const int     h      = pv->height;
-    const size_t  pixels = (size_t)w * h;
-    const float * c      = pv->colour;
-    const float * b      = pv->previous;
-    const double  cut    = dlssnr_sum_abs_diff(c, b, pixels * 3);
+    const int      h      = pv->height;
+    const size_t   pixels = (size_t)pv->width * h;
+    dlssnr_band_t  band   = { pv, 0 };
 
+    // the change at each pixel, and the frame's as a whole
+    nr_parallel_rows((size_t)h, dlssnr_rows_moved, &band);
+    double cut = 0.0;
+    for (int y = 0; y < h; y++)
+    {
+        cut += pv->row_sums[y];
+    }
     if (pixels && cut / (double)(pixels * 3) > DLSSNR_CUT_LIMIT)
     {
         hb_deep_log(2, "dlssnr: cut at frame %d (change %.3f), history dropped",
@@ -838,11 +978,10 @@ static int dlssnr_release_history(hb_filter_private_t *pv)
         return 0;
     }
 
-    // the change at each pixel, as a byte; the largest within the radius;
-    // the colour pushed away from itself by that much
-    dlssnr_moved(c, b, pv->moved, pixels);
-    dlssnr_dilate(pv->moved, pv->dilate_scratch, w, h, DLSSNR_RELEASE_RADIUS);
-    dlssnr_gate(c, pv->moved, pv->gate_previous, pixels);
+    // the largest change within the radius, across then down, and the colour
+    // pushed away from itself by that much
+    nr_parallel_rows((size_t)h, dlssnr_rows_dilate_across, &band);
+    nr_parallel_rows((size_t)h, dlssnr_rows_dilate_down, &band);
     return 1;
 }
 
@@ -877,6 +1016,8 @@ static void dlssnr_free_buffers(hb_filter_private_t *pv)
     free(pv->head);           pv->head = NULL;
     free(pv->moved);          pv->moved = NULL;
     free(pv->dilate_scratch); pv->dilate_scratch = NULL;
+    free(pv->row_sums);       pv->row_sums = NULL;
+    free(pv->row_same);       pv->row_same = NULL;
     free(pv->colour_low);     pv->colour_low = NULL;
     free(pv->head_low);       pv->head_low = NULL;
     free(pv->resize_scratch); pv->resize_scratch = NULL;
@@ -890,6 +1031,7 @@ static void dlssnr_free_buffers(hb_filter_private_t *pv)
     pv->have_history = 0;
     pv->have_result  = 0;
     pv->scaled       = 0;
+    pv->crop         = 0;
     pv->width = pv->height = 0;
     pv->filter_width = pv->filter_height = 0;
 }
@@ -926,6 +1068,10 @@ static int dlssnr_alloc_buffers(hb_filter_private_t *pv, int width, int height)
     nr_frame_geometry_min(pv->filter_height, pv->filter_width, pv->params.min_extent,
                           &pv->network_height, &pv->network_width);
     const size_t network = (size_t)pv->network_height * pv->network_width;
+    // The field is the filter extent padded up. Padded only downwards, its
+    // first filter_height rows are the head cropped already, as they lie;
+    // padded to the right, each row has to be cut to length.
+    pv->crop = pv->network_width != pv->filter_width;
 
     pv->rgb_stride = FFALIGN(width * (int)sizeof(float), 64);
     for (int c = 0; c < 3; c++)
@@ -960,15 +1106,27 @@ static int dlssnr_alloc_buffers(hb_filter_private_t *pv, int width, int height)
     pv->gate_previous  = malloc(pixels * 3 * sizeof(float));
     pv->features       = malloc(network * 16 * sizeof(float));
     pv->wide           = malloc(network * 4 * sizeof(float));
-    pv->head           = malloc(pixels * 4 * sizeof(float));
     pv->moved          = malloc(pixels);
     pv->dilate_scratch = malloc(pixels);
+    pv->row_sums       = malloc((size_t)height * sizeof(double));
+    pv->row_same       = malloc((size_t)height);
     if (pv->colour == NULL || pv->composed == NULL || pv->neural == NULL ||
         pv->history == NULL || pv->previous == NULL || pv->gate_previous == NULL ||
-        pv->features == NULL || pv->wide == NULL || pv->head == NULL ||
-        pv->moved == NULL || pv->dilate_scratch == NULL)
+        pv->features == NULL || pv->wide == NULL ||
+        pv->moved == NULL || pv->dilate_scratch == NULL ||
+        pv->row_sums == NULL || pv->row_same == NULL)
     {
         goto fail;
+    }
+    // The head at the frame's extent, unless the field's rows are it already
+    // (unscaled and no wider than the frame), when `wide` is read as it lies.
+    if (pv->scaled || pv->crop)
+    {
+        pv->head = malloc(pixels * 4 * sizeof(float));
+        if (pv->head == NULL)
+        {
+            goto fail;
+        }
     }
 
     if (pv->scaled)
@@ -978,11 +1136,18 @@ static int dlssnr_alloc_buffers(hb_filter_private_t *pv, int width, int height)
         const size_t down = (size_t)pv->filter_height * width * 3;
         const size_t up   = (size_t)height * pv->filter_width * 4;
         pv->colour_low     = malloc(filter_pixels * 3 * sizeof(float));
-        pv->head_low       = malloc(filter_pixels * 4 * sizeof(float));
         pv->resize_scratch = malloc((down > up ? down : up) * sizeof(float));
-        if (pv->colour_low == NULL || pv->head_low == NULL || pv->resize_scratch == NULL)
+        if (pv->colour_low == NULL || pv->resize_scratch == NULL)
         {
             goto fail;
+        }
+        if (pv->crop)
+        {
+            pv->head_low = malloc(filter_pixels * 4 * sizeof(float));
+            if (pv->head_low == NULL)
+            {
+                goto fail;
+            }
         }
         if (pv->filter_height != height &&
             (dlssnr_plan_init(&pv->down_rows, height, pv->filter_height) != 0 ||
@@ -1006,18 +1171,19 @@ static int dlssnr_alloc_buffers(hb_filter_private_t *pv, int width, int height)
     if (pv->scaled)
     {
         hb_log("dlssnr: %dx%d frame, network at %dx%d (max-height %d) on a %dx%d field, "
-               "%s, history %s",
+               "%s, history %s, %u threads",
                width, height, pv->filter_width, pv->filter_height, pv->settings.max_height,
                pv->network_width, pv->network_height,
                av_get_pix_fmt_name(pv->input.pix_fmt),
-               pv->settings.history ? "on" : "off");
+               pv->settings.history ? "on" : "off", nr_host_threads());
     }
     else
     {
-        hb_log("dlssnr: %dx%d frame, %dx%d network field, %s, history %s",
+        hb_log("dlssnr: %dx%d frame, %dx%d network field%s, %s, history %s, %u threads",
                width, height, pv->network_width, pv->network_height,
+               pv->crop ? "" : " (the head read as it lies)",
                av_get_pix_fmt_name(pv->input.pix_fmt),
-               pv->settings.history ? "on" : "off");
+               pv->settings.history ? "on" : "off", nr_host_threads());
     }
     return 0;
 
@@ -1056,6 +1222,14 @@ static void dlssnr_stats(const char *name, const float *a, size_t n, int frame)
                 frame, name, n, bad, mn, mx, n > bad ? sum / (double)(n - bad) : 0.0);
 }
 
+// The time since `since`, in microseconds, onto `into`; `since` moves on.
+static inline void dlssnr_lap(int64_t *into, int64_t *since)
+{
+    const int64_t now = av_gettime_relative();
+    *into += now - *since;
+    *since = now;
+}
+
 /* -------------------------------------------------------------------------
  * One pass: the three stages of nr_frame_main.c, in order, over `colour`
  * into `composed` -- the network at the filter extent, the composition at
@@ -1069,10 +1243,12 @@ static int dlssnr_pass(hb_filter_private_t *pv, const nr_frame_params *params)
     const int    fw     = pv->filter_width;
     const int    fh     = pv->filter_height;
     const size_t pixels = (size_t)w * h;
+    int64_t      since  = av_gettime_relative();
 
     // 1. the history, released where the picture moved, dropped on a cut
     int use_history = pv->settings.history && pv->have_history &&
                       dlssnr_release_history(pv);
+    dlssnr_lap(&pv->phases.release, &since);
 
     // 2. the network's input: the colour as it is, or brought down to the
     //    network's extent -- the daemon's `nr_daemon.resample`, bilinear
@@ -1085,12 +1261,16 @@ static int dlssnr_pass(hb_filter_private_t *pv, const nr_frame_params *params)
                       pv->resize_scratch, pv->colour_low);
         input    = pv->colour_low;
         mask_low = pv->use_mask ? pv->mask_low : NULL;
+        dlssnr_lap(&pv->phases.down, &since);
     }
 
     // 3. features, the network, the composition -- one pass at a time in the
     //    model, whose graph is prepared for one extent
-    const char *failure = NULL;
+    const char  *failure = NULL;
+    const float *head    = NULL;
     pthread_mutex_lock(&model_mutex);
+    // the wait for another instance's pass is nobody's stage
+    since = av_gettime_relative();
     nr_frame *frame = model_frame;
     if (frame == NULL)
     {
@@ -1102,37 +1282,49 @@ static int dlssnr_pass(hb_filter_private_t *pv, const nr_frame_params *params)
     {
         failure = "nr_frame_features_masked() failed";
     }
-    else if (nr_frame_run_features(frame, pv->features, pv->network_height,
-                                   pv->network_width, pv->wide) != 0)
-    {
-        failure = "nr_frame_run_features() failed";
-    }
     else
     {
-        // geometry.crop(head), at the network's extent
-        float *cropped = pv->scaled ? pv->head_low : pv->head;
-        for (int y = 0; y < fh; y++)
+        dlssnr_lap(&pv->phases.features, &since);
+        if (nr_frame_run_features(frame, pv->features, pv->network_height,
+                                  pv->network_width, pv->wide) != 0)
         {
-            memcpy(cropped + (size_t)y * fw * 4,
-                   pv->wide + (size_t)y * pv->network_width * 4,
-                   (size_t)fw * 4 * sizeof(float));
+            failure = "nr_frame_run_features() failed";
         }
+        dlssnr_lap(&pv->phases.network, &since);
+    }
+    if (failure == NULL)
+    {
+        // geometry.crop(head), at the network's extent: the field's first fh
+        // rows as they lie when it is no wider than the filter extent, each
+        // row cut to length otherwise
+        const float *cropped = pv->wide;
+        if (pv->crop)
+        {
+            dlssnr_crop_t crop = { pv->wide, pv->scaled ? pv->head_low : pv->head,
+                                   pv->network_width, fw };
+            nr_parallel_rows((size_t)fh, dlssnr_rows_crop, &crop);
+            cropped = crop.cropped;
+        }
+        head = cropped;
         // and brought up to the frame's, as nr_frame_compose_encode brings a
         // render-scale head up before composing it over the full picture
         if (pv->scaled)
         {
-            dlssnr_resize(pv->head_low, fh, fw, 4, h, w, &pv->up_rows, &pv->up_cols,
+            dlssnr_resize(cropped, fh, fw, 4, h, w, &pv->up_rows, &pv->up_cols,
                           pv->resize_scratch, pv->head);
+            head = pv->head;
         }
+        dlssnr_lap(&pv->phases.up, &since);
         const float *hist = use_history ? pv->history : NULL;
         const float *prev = use_history ? pv->gate_previous : NULL;
         // `_neural` for the prediction as well as the picture: the picture is
         // what goes out, the prediction is what the next frame's history is
-        if (nr_frame_compose_neural(frame, pv->head, pv->colour, h, w, hist, prev,
+        if (nr_frame_compose_neural(frame, head, pv->colour, h, w, hist, prev,
                                     mask, params, pv->composed, pv->neural) != 0)
         {
             failure = "nr_frame_compose_neural() failed";
         }
+        dlssnr_lap(&pv->phases.compose, &since);
     }
     if (failure != NULL)
     {
@@ -1150,7 +1342,7 @@ static int dlssnr_pass(hb_filter_private_t *pv, const nr_frame_params *params)
 
     if (pv->frame_count == 0)
     {
-        dlssnr_stats("head", pv->head, pixels * 4, pv->frame_count);
+        dlssnr_stats("head", head, pixels * 4, pv->frame_count);
         dlssnr_stats("composed", pv->composed, pixels * 3, pv->frame_count);
     }
 
@@ -1188,37 +1380,40 @@ static int dlssnr_process(hb_filter_private_t *pv, hb_buffer_t *in, hb_buffer_t 
         }
     }
 
-    // 1. the picture as float RGB in [0, 1]
-    uint8_t * in_data[4];
-    int       in_stride[4];
-    int       rgb_stride[3] = { pv->rgb_stride, pv->rgb_stride, pv->rgb_stride };
+    // 1. this frame's parameters
+    nr_frame_params params = pv->params;
+    params.frame_index = pv->settings.frame_index +
+                         pv->frame_count * pv->settings.frame_step;
+
+    // 2. the picture as float RGB in [0, 1] -- compared on the way, row by
+    //    row, with the frame before when its pass could stand for this one:
+    //    the parameters the same (so never with a frame step, which reseeds
+    //    the noise), and a pass behind them
+    int64_t       since = av_gettime_relative();
+    uint8_t     * in_data[4];
+    int           in_stride[4];
+    int           rgb_stride[3] = { pv->rgb_stride, pv->rgb_stride, pv->rgb_stride };
+    dlssnr_band_t band = { pv, pv->have_result &&
+                               memcmp(&params, &pv->last_params, sizeof(params)) == 0 };
     dlssnr_planes(in_data, in_stride, in);
     sws_scale(pv->to_rgb, (const uint8_t * const *)in_data, in_stride, 0, h,
               pv->rgb_planes, rgb_stride);
-    for (int y = 0; y < h; y++)
-    {
-        const float *g = (const float *)(pv->rgb_planes[0] + (size_t)y * pv->rgb_stride);
-        const float *b = (const float *)(pv->rgb_planes[1] + (size_t)y * pv->rgb_stride);
-        const float *r = (const float *)(pv->rgb_planes[2] + (size_t)y * pv->rgb_stride);
-        dlssnr_interleave(r, g, b, pv->colour + (size_t)y * w * 3, w);
-    }
+    nr_parallel_rows((size_t)h, dlssnr_rows_to_colour, &band);
+    dlssnr_lap(&pv->phases.convert_in, &since);
 
     if (pv->frame_count == 0)
     {
         dlssnr_stats("colour in", pv->colour, pixels * 3, pv->frame_count);
     }
 
-    // 2. this frame's parameters
-    nr_frame_params params = pv->params;
-    params.frame_index = pv->settings.frame_index +
-                         pv->frame_count * pv->settings.frame_step;
-
-    // 3. the pass -- unless this frame is the frame before, bit for bit, with
-    //    the parameters the frame before had (so never with a frame step,
-    //    which reseeds the noise), in which case its composition stands
-    if (pv->have_result &&
-        memcmp(&params, &pv->last_params, sizeof(params)) == 0 &&
-        memcmp(pv->colour, pv->previous, pixels * 3 * sizeof(float)) == 0)
+    // 3. the pass -- unless this frame is the frame before, bit for bit, in
+    //    which case its composition stands
+    int repeat = band.compare;
+    for (int y = 0; repeat && y < h; y++)
+    {
+        repeat = pv->row_same[y];
+    }
+    if (repeat)
     {
         pv->repeats++;
         hb_deep_log(3, "dlssnr: frame %d repeats the frame before, its pass reused",
@@ -1230,18 +1425,14 @@ static int dlssnr_process(hb_filter_private_t *pv, hb_buffer_t *in, hb_buffer_t 
     }
 
     // 4. the composition back into the pipeline's pixel format
-    for (int y = 0; y < h; y++)
-    {
-        float       *g = (float *)(pv->rgb_planes[0] + (size_t)y * pv->rgb_stride);
-        float       *b = (float *)(pv->rgb_planes[1] + (size_t)y * pv->rgb_stride);
-        float       *r = (float *)(pv->rgb_planes[2] + (size_t)y * pv->rgb_stride);
-        dlssnr_deinterleave(pv->composed + (size_t)y * w * 3, r, g, b, w);
-    }
+    since = av_gettime_relative();
+    nr_parallel_rows((size_t)h, dlssnr_rows_from_composed, &band);
     uint8_t * out_data[4];
     int       out_stride[4];
     dlssnr_planes(out_data, out_stride, out);
     int rows = sws_scale(pv->from_rgb, (const uint8_t * const *)pv->rgb_planes, rgb_stride,
                          0, h, out_data, out_stride);
+    dlssnr_lap(&pv->phases.convert_out, &since);
     if (pv->frame_count == 0)
     {
         hb_deep_log(2, "dlssnr: frame 0 back to %s: %d rows, in Y[%d][%d] %d -> out %d, "
@@ -1332,6 +1523,22 @@ static void dlssnr_close(hb_filter_object_t *filter)
     {
         hb_log("dlssnr: %d of %d frames repeated the frame before and reused its pass",
                pv->repeats, pv->frame_count);
+    }
+    if (pv->frame_count > 0)
+    {
+        // where the time went, as milliseconds a frame: the stages of a pass
+        // over the frames that had one, the conversions over them all
+        const dlssnr_phases_t *t      = &pv->phases;
+        const int              passes = pv->frame_count - pv->repeats;
+        const double           frames = (double)pv->frame_count;
+        const double           per    = passes > 0 ? 1.0 / (1000.0 * passes) : 0.0;
+        hb_log("dlssnr: %d frames, %d passes; ms a frame -- in %.2f, out %.2f; "
+               "ms a pass -- release %.2f, down %.2f, features %.2f, network %.2f, "
+               "up %.2f, compose %.2f",
+               pv->frame_count, passes,
+               t->convert_in / (1000.0 * frames), t->convert_out / (1000.0 * frames),
+               t->release * per, t->down * per, t->features * per, t->network * per,
+               t->up * per, t->compose * per);
     }
     dlssnr_free_buffers(pv);
     free(pv->mask_source);

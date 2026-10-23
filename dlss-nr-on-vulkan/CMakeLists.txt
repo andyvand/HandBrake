@@ -22,8 +22,8 @@
 #                   into it by the Metal compiler (NR_BUILD_METAL; NR_GPU_BACKEND=metal at run time)
 #   Windows         libd3dmx, the same runtime on Direct3D 12 with the kernels written in HLSL
 #                   and compiled to DXIL by dxc, embedded (NR_BUILD_D3D12, on for every Windows
-#                   target but 32-bit x86; NR_GPU_BACKEND=d3d12 at run time); wherever it is
-#                   built, libdlssnr is built from it instead of libxmx (NR_DLSSNR_D3D12)
+#                   target but 32-bit x86; NR_GPU_BACKEND=d3d12 at run time); libdlssnr stays
+#                   on libxmx unless NR_DLSSNR_D3D12 builds it from libd3dmx instead
 #   Android         the libraries, libdlssnr and the executables against the NDK's libvulkan.so,
 #                   with the NDK's own toolchain file; the layer stays off (there is no game to
 #                   hook and no daemon), bin2c and slice are built for the build machine
@@ -39,6 +39,14 @@
 # APK. Built and linked here for arm64-v8a; nothing has run on a device yet (notes/phase72).
 cmake_minimum_required(VERSION 3.21)
 project(dlss_nr_on_vulkan LANGUAGES C)
+
+# The configuration report is for this tree built on its own; inside
+# another project (VBA-M) it is VERBOSE, shown by cmake --log-level=VERBOSE.
+if(PROJECT_IS_TOP_LEVEL)
+  set(NR_STATUS STATUS)
+else()
+  set(NR_STATUS VERBOSE)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -95,12 +103,16 @@ if(WIN32)
     set(NR_WIN32_X86 ON)
   endif()
 endif()
-option(NR_BUILD_D3D12 "Windows (x64, ARM64): build libd3dmx, the compute runtime on Direct3D 12, with the HLSL compiled to DXIL and embedded" OFF)
+set(NR_D3D12_DEFAULT OFF)
+if(WIN32 AND NOT NR_WIN32_X86)
+  set(NR_D3D12_DEFAULT ON)
+endif()
+option(NR_BUILD_D3D12 "Windows (x64, ARM64): build libd3dmx, the compute runtime on Direct3D 12, with the HLSL compiled to DXIL and embedded" ${NR_D3D12_DEFAULT})
 if(NR_BUILD_D3D12 AND NOT WIN32)
   message(FATAL_ERROR "NR_BUILD_D3D12 is on and this is not a Windows build; libd3dmx exists on Windows only")
 endif()
 if(WIN32 AND NR_WIN32_X86 AND NOT NR_BUILD_D3D12)
-  message(STATUS "32-bit x86 Windows: libd3dmx is not built and libdlssnr stays the Vulkan archive (-DNR_BUILD_D3D12=ON asks for it anyway)")
+  message(${NR_STATUS} "32-bit x86 Windows: libd3dmx is not built and libdlssnr stays the Vulkan archive (-DNR_BUILD_D3D12=ON asks for it anyway)")
 endif()
 if(NR_BUILD_D3D12)
   # dxc runs on the build machine: the host triplet's copy first in a vcpkg cross build (the
@@ -115,9 +127,28 @@ if(NR_BUILD_D3D12)
   if(nr_dxc_host_dirs)
     find_program(NR_DXC NAMES dxc.exe dxc PATHS ${nr_dxc_host_dirs} NO_DEFAULT_PATH)
   endif()
-  set(nr_dxc_sdk_dirs "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin" "$ENV{WindowsSdkVerBinPath}/x64" "$ENV{WindowsSdkVerBinPath}/arm64")
-  file(GLOB nr_windows_kits_bins "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64" "C:/Program Files (x86)/Windows Kits/10/bin/10.*/arm64")
-  list(APPEND nr_dxc_sdk_dirs ${nr_windows_kits_bins})
+  # The Windows SDK ships a dxc per architecture, and only the build machine's can run: an x64
+  # host cannot start the arm64 one ("not compatible with the version of Windows"). An ARM64
+  # host takes its own first and the x64 one, which it emulates, after it. A dxc of the wrong
+  # architecture cached by an earlier configure is dropped.
+  if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^([aA][rR][mM]64|[aA][aA][rR][cC][hH]64)$")
+    set(nr_dxc_host_archs arm64 x64)
+  else()
+    set(nr_dxc_host_archs x64)
+    if(NR_DXC MATCHES "/arm64/")
+      unset(NR_DXC CACHE)
+    endif()
+  endif()
+  set(nr_dxc_sdk_dirs "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  foreach(arch ${nr_dxc_host_archs})
+    list(APPEND nr_dxc_sdk_dirs "$ENV{WindowsSdkVerBinPath}/${arch}")
+  endforeach()
+  foreach(arch ${nr_dxc_host_archs})
+    # newest SDK first
+    file(GLOB nr_windows_kits_bins "C:/Program Files (x86)/Windows Kits/10/bin/10.*/${arch}")
+    list(SORT nr_windows_kits_bins COMPARE NATURAL ORDER DESCENDING)
+    list(APPEND nr_dxc_sdk_dirs ${nr_windows_kits_bins})
+  endforeach()
   find_program(NR_DXC NAMES dxc.exe dxc HINTS ${nr_dxc_sdk_dirs} DOC "the DirectX shader compiler, for the HLSL kernels")
   if(NOT NR_DXC)
     message(WARNING "dxc not found (Windows SDK, Vulkan SDK or vcpkg directx-dxc): libd3dmx is not built and libdlssnr stays the Vulkan archive; -DNR_DXC= names one, -DNR_BUILD_D3D12=OFF silences this")
@@ -126,14 +157,14 @@ if(NR_BUILD_D3D12)
     message(FATAL_ERROR "dxc found only as the target triplet's, ${NR_DXC}, which cannot run on this machine. Install it for the host (vcpkg install directx-dxc --triplet <host triplet>) or name one with -DNR_DXC=")
   endif()
 endif()
-# libdlssnr from libd3dmx rather than libxmx. Follows NR_BUILD_D3D12: wherever the Direct3D 12
-# runtime is built, the static archive a host links carries it — libd3dmx's objects and the
-# DXIL, no Vulkan anywhere in it; nr_frame_adopt_d3d12 is the share, nr_frame_adopt_vulkan is
-# refused and nr_frame_runtime() says "d3d12". -DNR_DLSSNR_D3D12=OFF keeps the Vulkan archive
-# beside libd3dmx.dll, for a host whose renderer lends a Vulkan device. The value is fixed on
-# the first configure, as a cache variable's is: a dxc installed later, or -DNR_BUILD_D3D12
-# changed afterwards, needs -DNR_DLSSNR_D3D12= set to match (or a fresh cache).
-option(NR_DLSSNR_D3D12 "Windows: build libdlssnr, the static archive a host links, from libd3dmx (Direct3D 12) instead of libxmx (Vulkan); follows NR_BUILD_D3D12" ${NR_BUILD_D3D12})
+# libdlssnr from libd3dmx rather than libxmx. Off by default: the archive a host links stays
+# on Vulkan, beside libd3dmx.dll, because libd3dmx has no matrix path (HLSL has no shipped
+# matrix-matrix operation) and libxmx does wherever the driver lists cooperative matrices. On
+# a Radeon 780M under AMD's Windows driver, nr_frame_rates at 720x480 took 285 ms a frame on
+# libd3dmx against 95 on libxmx's 16x16x16 path (2026-10-15). On, the archive carries
+# libd3dmx's objects and the DXIL, no Vulkan anywhere in it; nr_frame_adopt_d3d12 is the
+# share, nr_frame_adopt_vulkan is refused and nr_frame_runtime() says "d3d12".
+option(NR_DLSSNR_D3D12 "Windows: build libdlssnr, the static archive a host links, from libd3dmx (Direct3D 12) instead of libxmx (Vulkan); needs NR_BUILD_D3D12" OFF)
 if(NR_DLSSNR_D3D12 AND NOT NR_BUILD_D3D12)
   message(FATAL_ERROR "NR_DLSSNR_D3D12 needs NR_BUILD_D3D12 (Windows, with dxc found); pass -DNR_DLSSNR_D3D12=OFF as well to build libdlssnr from libxmx")
 endif()
@@ -183,7 +214,7 @@ if(NR_EMBED_WEIGHTS AND NR_BIN2C_WEIGHTS)
   if(EXISTS "${NR_WEIGHTS_FILE}")
     set(NR_REGENERATE_WEIGHTS ON)
   else()
-    message(STATUS "NR_BIN2C_WEIGHTS: no dlssnr-prepared.safetensors or dlssnr-logical.safetensors (source root, work/mlxw/, or -DNR_WEIGHTS_FILE=); bin2c skipped, using the weights directory as it is")
+    message(${NR_STATUS} "NR_BIN2C_WEIGHTS: no dlssnr-prepared.safetensors or dlssnr-logical.safetensors (source root, work/mlxw/, or -DNR_WEIGHTS_FILE=); bin2c skipped, using the weights directory as it is")
   endif()
 endif()
 if(NR_EMBED_WEIGHTS AND NOT NR_REGENERATE_WEIGHTS)
@@ -506,7 +537,7 @@ if(NR_REGENERATE_WEIGHTS OR NR_EMBED_SHADERS OR NR_BUILD_METAL OR NR_BUILD_D3D12
       set(NR_SLICE "${nr_host_tools_dir}/slice_dlss${nr_host_exe_suffix}")
       host_compile("${PROJECT_SOURCE_DIR}/src/tools/bin2c.c" "${NR_BIN2C}")
       host_compile("${PROJECT_SOURCE_DIR}/src/tools/slice.c" "${NR_SLICE}")
-      message(STATUS "cross-compiling: bin2c and slice built for the host with host_compile()")
+      message(${NR_STATUS} "cross-compiling: bin2c and slice built for the host with host_compile()")
     endif()
     if(NOT nr_host_compile AND NOT NR_BIN2C AND NOT NR_SLICE)
       # Standalone -- an NDK toolchain file, say -- the module is not there, so do the
@@ -544,7 +575,7 @@ if(NR_REGENERATE_WEIGHTS OR NR_EMBED_SHADERS OR NR_BUILD_METAL OR NR_BUILD_D3D12
         add_custom_command(OUTPUT "${NR_SLICE}"
           COMMAND "${NR_HOST_CC}" "${PROJECT_SOURCE_DIR}/src/tools/slice.c" -o "${NR_SLICE}"
           DEPENDS "${PROJECT_SOURCE_DIR}/src/tools/slice.c" COMMENT "host cc slice_dlss" VERBATIM)
-        message(STATUS "cross-compiling: bin2c and slice built for the host with ${NR_HOST_CC}")
+        message(${NR_STATUS} "cross-compiling: bin2c and slice built for the host with ${NR_HOST_CC}")
       endif()
     endif()
     if(NOT NR_BIN2C)
@@ -682,7 +713,7 @@ const size_t nr_embedded_shader_count = ${NR_SPV_COUNT};
   set_target_properties(nr_shaders_blob PROPERTIES POSITION_INDEPENDENT_CODE ON)
   nr_no_ipo(nr_shaders_blob)
   set(NR_SHADER_OBJECTS $<TARGET_OBJECTS:nr_shaders_blob>)
-  message(STATUS "embedding ${NR_SPV_COUNT} SPIR-V modules into libxmx and gemm_runner")
+  message(${NR_STATUS} "embedding ${NR_SPV_COUNT} SPIR-V modules into libxmx and gemm_runner")
 endif()
 
 # ---------------------------------------------------------------------------------------
@@ -752,14 +783,34 @@ if(NR_BUILD_METAL)
     DEPENDS "${NR_METALLIB}" ${NR_BIN2C} COMMENT "bin2c nr_metallib.h" VERBATIM)
   add_custom_target(metal_shaders ALL DEPENDS "${NR_METALLIB}")
 
-  # The same sources as Metal 4 (NR_METAL4: the GEMMs' K loop on Metal Performance
-  # Primitives' matmul2d), a second library libmetalmx loads on a device and OS in
+  # The same sources as Metal 4 (NR_METAL4: the GEMMs' K loop and the fused kernels' products
+  # on Metal Performance Primitives' matmul2d, which an M5 and later run on their matrix
+  # units), a second library libmetalmx loads on a device and OS in
   # MTLGPUFamilyMetal4 and keeps the Metal 3.1 one for everything else. Built only when this
   # SDK's compiler takes -std=metal4.0 (Xcode 26 and later); an older SDK builds the Metal 3
   # library alone, and the runtime then has nothing else to choose.
+  #
+  # And only for a build that runs on Apple silicon: arm64, or universal. Metal 4 is Apple
+  # silicon's -- no Intel Mac's GPU is in MTLGPUFamilyMetal4 -- so an x86_64 build would carry
+  # a library it can never load, and would need Xcode 26 to build it.
   set(NR_METAL4_HEADER)
   set(NR_METAL4_DEFINES)
-  option(NR_METAL4 "libmetalmx: also embed a Metal 4 metallib, used where the device and OS have Metal 4" ON)
+  if(CMAKE_OSX_ARCHITECTURES)
+    if(CMAKE_OSX_ARCHITECTURES MATCHES "[aA][rR][mM]64")
+      set(nr_metal4_arch ON)
+    else()
+      set(nr_metal4_arch OFF)
+    endif()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^([aA][rR][mM]64|aarch64)$")
+    set(nr_metal4_arch ON)
+  else()
+    set(nr_metal4_arch OFF)
+  endif()
+  option(NR_METAL4 "libmetalmx: also embed a Metal 4 metallib, used where the device and OS have Metal 4" ${nr_metal4_arch})
+  if(NR_METAL4 AND NOT nr_metal4_arch)
+    message(${NR_STATUS} "libmetalmx: an x86_64 build, which no Metal 4 GPU runs; the Metal 3.1 library alone")
+    set(NR_METAL4 OFF)
+  endif()
   if(NR_METAL4)
     set(probe_dir "${CMAKE_CURRENT_BINARY_DIR}/metal4_probe")
     file(MAKE_DIRECTORY "${probe_dir}")
@@ -768,7 +819,7 @@ if(NR_BUILD_METAL)
     execute_process(COMMAND "${NR_XCRUN}" -sdk macosx metal -std=metal4.0 -c -o "${probe_dir}/probe.air" "${probe_dir}/probe.metal"
                     RESULT_VARIABLE metal4_rc OUTPUT_QUIET ERROR_QUIET)
     if(NOT metal4_rc EQUAL 0)
-      message(STATUS "libmetalmx: this SDK's Metal compiler has no -std=metal4.0; the Metal 3.1 library alone")
+      message(${NR_STATUS} "libmetalmx: this SDK's Metal compiler has no -std=metal4.0; the Metal 3.1 library alone")
       set(NR_METAL4 OFF CACHE BOOL "" FORCE)
     endif()
   endif()
@@ -804,7 +855,7 @@ if(NR_BUILD_METAL)
   target_compile_options(metalmx PRIVATE -fobjc-arc ${NR_WARN_FLAGS})
   target_link_libraries(metalmx PRIVATE "-framework Metal" "-framework Foundation")
   nr_place(metalmx)
-  message(STATUS "libmetalmx: the compute runtime on Metal, shaders compiled into it (NR_GPU_BACKEND=metal selects it)")
+  message(${NR_STATUS} "libmetalmx: the compute runtime on Metal, shaders compiled into it (NR_GPU_BACKEND=metal selects it)")
 endif()
 
 # ---------------------------------------------------------------------------------------
@@ -927,7 +978,7 @@ const size_t nr_embedded_dxil_count = ${NR_DXIL_COUNT};
   target_compile_definitions(d3dmx PRIVATE NR_EMBEDDED_DXIL=1)
   target_compile_options(d3dmx PRIVATE ${NR_WARN_FLAGS})
   nr_place(d3dmx)
-  message(STATUS "libd3dmx: the compute runtime on Direct3D 12, ${NR_DXIL_COUNT} DXIL modules compiled into it by ${NR_DXC} (NR_GPU_BACKEND=d3d12 selects it)")
+  message(${NR_STATUS} "libd3dmx: the compute runtime on Direct3D 12, ${NR_DXIL_COUNT} DXIL modules compiled into it by ${NR_DXC} (NR_GPU_BACKEND=d3d12 selects it)")
 endif()
 
 # ---------------------------------------------------------------------------------------
@@ -1117,7 +1168,7 @@ const size_t nr_embedded_weights_size = ${NR_WEIGHTS_SIZE};
       set_source_files_properties("${NR_WEIGHTS_DIR}/${symbol}.c" PROPERTIES OBJECT_DEPENDS "${NR_WEIGHTS_DIR}/${symbol}.h")
       list(APPEND NR_EMBED_SOURCES "${NR_WEIGHTS_DIR}/${symbol}.c")
     endforeach()
-    message(STATUS "embedding the pre-processed weights in ${NR_WEIGHTS_DIR}: ${NR_EMBED_COUNT} slices, ${NR_EMBED_JOBS} compiled at a time")
+    message(${NR_STATUS} "embedding the pre-processed weights in ${NR_WEIGHTS_DIR}: ${NR_EMBED_COUNT} slices, ${NR_EMBED_JOBS} compiled at a time")
   endif()
   add_library(nr_weights_blob OBJECT ${NR_EMBED_SOURCES} "${NR_WEIGHTS_DIR}/nr_weights_embedded.c")
   target_include_directories(nr_weights_blob PRIVATE src/ref "${NR_WEIGHTS_DIR}")
@@ -1173,7 +1224,7 @@ if(NR_BUILD_METAL)
   set_source_files_properties(src/gpu/libmetalmx.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
   target_link_libraries(dlssnr PUBLIC "-framework Metal" "-framework Foundation")
   set(NR_DLSSNR_HOST_LIBS)                        # the test plays a host that brings no Vulkan
-  message(STATUS "libdlssnr carries libmetalmx (Metal); -DNR_BUILD_METAL=OFF for the Vulkan archive")
+  message(${NR_STATUS} "libdlssnr carries libmetalmx (Metal); -DNR_BUILD_METAL=OFF for the Vulkan archive")
 elseif(NR_DLSSNR_D3D12)
   # the Direct3D 12 archive: libd3dmx's objects and the DXIL, no Vulkan and no import
   # library (d3d12.dll and dxgi.dll are loaded at run time); a host shares its device
@@ -1185,7 +1236,7 @@ elseif(NR_DLSSNR_D3D12)
     PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/ref>)
   target_compile_definitions(dlssnr PRIVATE NR_STATIC_XMX=1 NR_STATIC_D3D12=1 NR_EMBEDDED_DXIL=1)
   set(NR_DLSSNR_HOST_LIBS)                        # the test plays a host that brings no Vulkan
-  message(STATUS "libdlssnr carries libd3dmx (Direct3D 12); -DNR_DLSSNR_D3D12=OFF for the Vulkan archive")
+  message(${NR_STATUS} "libdlssnr carries libd3dmx (Direct3D 12); -DNR_DLSSNR_D3D12=OFF for the Vulkan archive")
 else()
   add_library(dlssnr STATIC src/gpu/libxmx.c src/ref/nr_frame.c
     $<TARGET_OBJECTS:nr_image_objects> ${NR_EMBED_OBJECTS} ${NR_SHADER_OBJECTS})
@@ -1198,9 +1249,9 @@ else()
   endif()
   set(NR_DLSSNR_HOST_LIBS ${NR_XMX_VULKAN})
   if(NR_BUILD_D3D12)
-    message(STATUS "libdlssnr carries libxmx (Vulkan) beside libd3dmx.dll; -DNR_DLSSNR_D3D12=ON for the Direct3D 12 archive")
+    message(${NR_STATUS} "libdlssnr carries libxmx (Vulkan) beside libd3dmx.dll; -DNR_DLSSNR_D3D12=ON for the Direct3D 12 archive")
   else()
-    message(STATUS "libdlssnr carries libxmx (Vulkan)")
+    message(${NR_STATUS} "libdlssnr carries libxmx (Vulkan)")
   endif()
 endif()
 if(NR_EMBED_WEIGHTS)
@@ -1241,7 +1292,7 @@ if(PNG_FOUND)
   endif()
   nr_executable(nr_frame_cli)
 else()
-  message(STATUS "libpng not found: the nr_frame command is not built (the libraries and tests are)")
+  message(${NR_STATUS} "libpng not found: the nr_frame command is not built (the libraries and tests are)")
 endif()
 
 # live_rates.py for the C library: the daemon's frame, end to end, in one process.
@@ -1516,5 +1567,5 @@ if(NR_BUILD_TESTS)
   endif()
 endif()
 
-message(STATUS "outputs -> ${NR_OUTPUT_DIR}; compute runtime links ${NR_XMX_VULKAN}; layer: ${NR_BUILD_LAYER}; nr_frame command: ${PNG_FOUND}; embedded weights: ${NR_EMBED_WEIGHTS} (regenerated: ${NR_REGENERATE_WEIGHTS}); embedded shaders: ${NR_EMBED_SHADERS}; Metal runtime: ${NR_BUILD_METAL}; Direct3D 12 runtime: ${NR_BUILD_D3D12} (in libdlssnr: ${NR_DLSSNR_D3D12})")
-message(STATUS "the Python finds this build with NR_BUILD_DIR=${NR_OUTPUT_DIR} (ctest sets it; without it the newest of work/ and build*/ wins)")
+message(${NR_STATUS} "outputs -> ${NR_OUTPUT_DIR}; compute runtime links ${NR_XMX_VULKAN}; layer: ${NR_BUILD_LAYER}; nr_frame command: ${PNG_FOUND}; embedded weights: ${NR_EMBED_WEIGHTS} (regenerated: ${NR_REGENERATE_WEIGHTS}); embedded shaders: ${NR_EMBED_SHADERS}; Metal runtime: ${NR_BUILD_METAL}; Direct3D 12 runtime: ${NR_BUILD_D3D12} (in libdlssnr: ${NR_DLSSNR_D3D12})")
+message(${NR_STATUS} "the Python finds this build with NR_BUILD_DIR=${NR_OUTPUT_DIR} (ctest sets it; without it the newest of work/ and build*/ wins)")
