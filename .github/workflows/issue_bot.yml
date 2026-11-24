@@ -4,39 +4,88 @@ on:
   issues:
     types:
       - opened
+  discussion:
+    types:
+      - created
 
 permissions:
   issues: write
   pull-requests: write
+  discussions: write
   
 jobs:
   greeting:
+    if: github.event_name == 'issues'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/first-interaction@v3
         with:
           issue_message: |-
-            Hello,
+            Hello, and welcome to the HandBrake repository.
+            
+            This is an automated message from the HandBrake Bot.
+            
+            > [!IMPORTANT]
+            > Please make sure you have completed the issue template and provide all the requested information.
 
-            Welcome to the HandBrake repository.
+            > [!WARNING]
+            > Be cautious of replies asking you to download DLLs or other files from third-party websites, particularly from users who are not members of the HandBrake team. These downloads may be malicious.
+            > HandBrake team members have a “Member” label beside their comments.
 
-            >[!WARNING]
-            >Please be cautious of any non-members suggesting that you download a "DLL" or any other files from 3rd party websites.
-            >These are likely malicious!
-            >Members of the HandBrake team can be identified by the "(Member)" label in the top right of any response from them.
+            > [!TIP]
+            > See the [HandBrake documentation](https://handbrake.fr/docs) for guidance and troubleshooting. Please also follow our [Code of Conduct](https://github.com/HandBrake/HandBrake/blob/master/CODE_OF_CONDUCT.md).
 
-            >[!TIP]
-            > For HandBrake documentation, please see https://handbrake.fr/docs
-
-            Thank You,
+            Thank you,
             The HandBrake Bot
           pr_message: |
-            Hello,
+            Hello, and welcome to the HandBrake repository.
 
-            Welcome to the HandBrake repository. Thank you for your submission. Please be patient while we review your submission. 
+            This is an automated message from the HandBrake Bot.
 
-            >[!TIP]
-            > For HandBrake documentation, please see https://handbrake.fr/docs
+            Thank you for your submission. Maintainer availability is limited. You can help us by completing all sections of the pull request template and providing relevant details about your changes and testing.
 
-            Thank You,
+            > [!TIP]
+            > Please read the [contributing guide](https://handbrake.fr/docs/en/latest/contributing/contribute.html) and follow the [Code of Conduct](https://github.com/HandBrake/HandBrake/blob/master/CODE_OF_CONDUCT.md).
+
+            Thank you,
             The HandBrake Bot
+
+  discussion-greeting:
+    if: github.event_name == 'discussion'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            await github.graphql(
+              `mutation($discussionId: ID!, $body: String!) {
+                addDiscussionComment(input: {
+                  discussionId: $discussionId,
+                  body: $body
+                }) {
+                  comment { id }
+                }
+              }`,
+              {
+                discussionId: context.payload.discussion.node_id,
+                body: `Hello
+            
+            This is an automated message from the HandBrake Bot.
+            
+            > [!WARNING]
+            > Be cautious of replies asking you to download DLLs or other files from third-party websites, particularly from users who are not members of the HandBrake team. These downloads may be malicious.
+            > HandBrake team members have a “Maintainer” label beside their username.
+
+            > [!TIP]
+            > **Need help with HandBrake?**
+            > Check the [HandBrake documentation](https://handbrake.fr/docs) for guides, troubleshooting advice, and answers to common questions.
+            > When participating in discussions, please follow our [Code of Conduct](https://github.com/HandBrake/HandBrake/blob/master/CODE_OF_CONDUCT.md) to help keep the community welcoming and respectful.
+                        
+            > [!NOTE]
+            > **Found a solution? Help others find it!**
+            > If your question is in the Q&A category and a reply resolves your issue, please use "Mark as Answer" on the helpful response. This makes it easier for others with the same question to find a solution.
+
+            Thank you,
+            The HandBrake Bot`
+              }
+            );

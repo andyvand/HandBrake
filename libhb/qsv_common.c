@@ -28,19 +28,6 @@
 #include "handbrake/av1_common.h"
 #include "handbrake/hbffmpeg.h"
 
-#ifndef HB_QSV_PRINT_RET_MSG
-#define HB_QSV_PRINT_RET_MSG(ERR)              { fprintf(stderr, "Error code %d,\t%s\t%d\n", ERR, __FUNCTION__, __LINE__); }
-#endif
-
-#ifndef HB_QSV_DEBUG_ASSERT
-#define HB_QSV_DEBUG_ASSERT(x,y)               { if ((x)) { fprintf(stderr, "\nASSERT: %s\n", y); } }
-#endif
-
-#define HB_QSV_CHECK_RET(P, X, ERR)                {if ((X) > (P)) {HB_QSV_PRINT_RET_MSG(ERR); return;}}
-#define HB_QSV_CHECK_RESULT(P, X, ERR)             {if ((X) > (P)) {HB_QSV_PRINT_RET_MSG(ERR); return ERR;}}
-#define HB_QSV_CHECK_POINTER(P, ERR)               {if (!(P)) {HB_QSV_PRINT_RET_MSG(ERR); return ERR;}}
-#define HB_QSV_IGNORE_MFX_STS(P, X)                {if ((X) == (P)) {P = MFX_ERR_NONE;}}
-
 #define HB_QSV_ASYNC_DEPTH_DEFAULT     4
 
 #define HB_QSV_AVC_DECODER_WIDTH_MAX   4096
@@ -136,7 +123,7 @@ static hb_triplet_t hb_qsv_h265_profiles[] =
 {
     { "Main",               "main",             MFX_PROFILE_HEVC_MAIN,   },
     { "Main 10",            "main10",           MFX_PROFILE_HEVC_MAIN10, },
-    { "Main Still Picture", "mainstillpicture", MFX_PROFILE_HEVC_MAINSP, },
+    { "Main Still Picture", "mainsp",           MFX_PROFILE_HEVC_MAINSP, },
     { NULL,                                                              },
 };
 static const char * const hb_qsv_h265_profiles_names_10bit[] = {
@@ -183,16 +170,6 @@ static hb_triplet_t hb_qsv_hyper_encode_modes[] =
     { NULL,                                                             },
 };
 
-static const enum AVPixelFormat hb_qsv_pix_fmts[] =
-{
-    AV_PIX_FMT_NV12, AV_PIX_FMT_NONE
-};
-
-static const enum AVPixelFormat hb_qsv_10bit_pix_fmts[] =
-{
-    AV_PIX_FMT_P010LE, AV_PIX_FMT_NONE
-};
-
 #define MFX_IMPL_VIA_MASK(impl) (0x0f00 & (impl))
 
 // check available Intel Media SDK version against a minimum
@@ -224,7 +201,7 @@ static hb_qsv_adapter_details_t* hb_qsv_get_adapters_details_by_index(int adapte
 {
     for (int i = 0; i < hb_list_count(g_qsv_adapters_details_list); i++)
     {
-        const hb_qsv_adapter_details_t *details = hb_list_item(g_qsv_adapters_details_list, i);
+        hb_qsv_adapter_details_t *details = hb_list_item(g_qsv_adapters_details_list, i);
         if (details->index == adapter_index || adapter_index == -1)
         {
             return details;
@@ -236,7 +213,7 @@ static hb_qsv_adapter_details_t* hb_qsv_get_adapters_details_by_index(int adapte
 int hb_qsv_get_adapter_render_node(int adapter_index)
 {
     const hb_qsv_adapter_details_t *details = hb_qsv_get_adapters_details_by_index(adapter_index);
-    return details->extended_device_id.DRMRenderNodeNum;
+    return details ? details->extended_device_id.DRMRenderNodeNum : 0;
 }
 
 int hb_qsv_set_adapter_index(int adapter_index)
@@ -443,37 +420,6 @@ int hb_qsv_info_init()
         return -1;
     }
     return 0;
-}
-
-#if defined(_WIN32) || defined(__MINGW32__)
-static void hb_qsv_free_adapters_details(hb_list_t *qsv_adapters_details_list)
-{
-    for (int i = 0; i < hb_list_count(qsv_adapters_details_list); i++)
-    {
-        hb_qsv_adapter_details_t *details = hb_list_item(qsv_adapters_details_list, i);
-        if (details)
-        {
-            av_free(details);
-        }
-    }
-}
-#endif
-
-void hb_qsv_info_close()
-{
-    if (g_qsv_adapters_details_list)
-    {
-#if defined(_WIN32) || defined(__MINGW32__)
-        hb_qsv_free_adapters_details(g_qsv_adapters_details_list);
-#endif
-        hb_list_close(&g_qsv_adapters_details_list);
-        g_qsv_adapters_details_list = NULL;
-    }
-    if (g_qsv_adapters_list)
-    {
-        hb_list_close(&g_qsv_adapters_list);
-        g_qsv_adapters_list = NULL;
-    }
 }
 
 static int hb_qsv_make_adapters_list(hb_list_t **qsv_adapters_list, hb_list_t **qsv_adapters_details_list)
@@ -1455,12 +1401,13 @@ static int query_capabilities(mfxSession session, int index, mfxVersion version,
     return 0;
 }
 
-const char * DRM_INTEL_DRIVER_NAME = "i915";
+// i915 for older GPUs, xe for Battlemage and newer
+const char * DRM_INTEL_DRIVER_NAMES[] = { "i915", "xe", NULL};
 const char * VA_INTEL_DRIVER_NAMES[] = { "iHD", "i965", NULL};
 
 hb_display_t * hb_qsv_display_init(const uint32_t dri_render_node)
 {
-    return hb_display_init(DRM_INTEL_DRIVER_NAME, dri_render_node, VA_INTEL_DRIVER_NAMES);
+    return hb_display_init(DRM_INTEL_DRIVER_NAMES, dri_render_node, VA_INTEL_DRIVER_NAMES);
 }
 
 #if defined(_WIN32) || defined(__MINGW32__)
@@ -2078,6 +2025,17 @@ const char* hb_qsv_decode_get_codec_name(enum AVCodecID codec_id)
     }
 }
 
+// Media SDK 1.x runtimes only support fixed size frame pools, and old
+// drivers fail to decode into D3D11 surface arrays larger than 64 surfaces,
+// which is not enough to hold all the frames in flight in the full hw pipeline
+static int hb_qsv_runtime_is_legacy(int adapter_index)
+{
+    hb_qsv_adapter_details_t *details = hb_qsv_get_adapters_details_by_index(adapter_index);
+    return details != NULL &&
+           details->qsv_hardware_version.Version &&
+           details->qsv_hardware_version.Major < 2;
+}
+
 int hb_qsv_decode_h264_is_supported(int adapter_index)
 {
     return hb_qsv_hardware_generation(hb_qsv_get_platform(adapter_index)) >= QSV_G1;
@@ -2322,6 +2280,16 @@ static int are_filters_supported(hb_list_t *filters)
 #endif
 }
 
+static int can_use_full_hw_pipeline(hb_list_t *filters)
+{
+    if (hb_qsv_runtime_is_legacy(hb_qsv_get_adapter_index()))
+    {
+        hb_deep_log(2, "qsv: full hw pipeline is not supported by the Media SDK 1.x runtime");
+        return 0;
+    }
+    return are_filters_supported(filters);
+}
+
 int hb_qsv_full_path_is_enabled(hb_job_t *job)
 {
     int qsv_full_path_is_enabled = 0;
@@ -2334,7 +2302,7 @@ int hb_qsv_full_path_is_enabled(hb_job_t *job)
 
     qsv_full_path_is_enabled = (job->hw_decode & HB_DECODE_QSV &&
         info && hb_qsv_implementation_is_hardware(info->implementation) &&
-        job->qsv_ctx && are_filters_supported(job->list_filter));
+        job->qsv_ctx && can_use_full_hw_pipeline(job->list_filter));
 #endif
     return qsv_full_path_is_enabled;
 }
@@ -2750,6 +2718,18 @@ int hb_qsv_apply_encoder_options(qsv_data_t * qsv_data, hb_job_t *job, AVDiction
         videoParam.mfx.CodecProfile = MFX_PROFILE_HEVC_MAIN10;
     }
 
+    if (hb_qsv_profile_parse(&qsv_data->param, qsv_data->qsv_info,
+                             job->encoder_profile, job->vcodec))
+    {
+        hb_error("hb_qsv_apply_encoder_options: bad profile %s", job->encoder_profile);
+        return -1;
+    }
+    if (job->encoder_profile != NULL && *job->encoder_profile &&
+        strcasecmp(job->encoder_profile, "auto"))
+    {
+        av_dict_set_int(av_opts, "profile", videoParam.mfx.CodecProfile, 0);
+    }
+
     if (job->encoder_options != NULL && *job->encoder_options)
     {
         hb_dict_t *options_list;
@@ -2998,7 +2978,7 @@ int hb_qsv_param_parse(AVDictionary** av_opts, hb_qsv_param_t *param, hb_qsv_inf
         fvalue = hb_qsv_atof(value, &error);
         if (!error)
         {
-            param->rc.vbv_buffer_init = HB_QSV_CLIP3(0, INT32_MAX, fvalue);
+            param->rc.vbv_buffer_init = HB_QSV_CLIP3(0, (float)INT32_MAX, fvalue);
         }
     }
     else if (!strcasecmp(key, "vbv-bufsize"))
@@ -3131,8 +3111,10 @@ int hb_qsv_param_parse(AVDictionary** av_opts, hb_qsv_param_t *param, hb_qsv_inf
         }
         if (!error)
         {
-            ivalue = ivalue ? MFX_PICSTRUCT_FIELD_TFF : MFX_PICSTRUCT_PROGRESSIVE;
-            av_dict_set_int(av_opts, "flags", ivalue, AV_DICT_APPEND);
+            if (ivalue)
+            {
+                av_dict_set(av_opts, "flags", "+ildct", AV_DICT_APPEND);
+            }
         }
     }
     else if (!strcasecmp(key, "bff"))
@@ -3147,8 +3129,11 @@ int hb_qsv_param_parse(AVDictionary** av_opts, hb_qsv_param_t *param, hb_qsv_inf
         }
         if (!error)
         {
-            ivalue = ivalue ? MFX_PICSTRUCT_FIELD_BFF : MFX_PICSTRUCT_PROGRESSIVE;
-            av_dict_set_int(av_opts, "flags", ivalue, AV_DICT_APPEND);
+            // qsvenc only supports top field first
+            if (ivalue)
+            {
+                return HB_QSV_PARAM_UNSUPPORTED;
+            }
         }
     }
     else if (!strcasecmp(key, "mbbrc"))
@@ -3398,7 +3383,7 @@ int hb_qsv_profile_parse(hb_qsv_param_t *param, hb_qsv_info_t *info, const char 
                 profile = hb_triplet4key(hb_qsv_h265_profiles, profile_key);
 
                 /* HEVC10 supported starting from KBL/G6 */
-                if (profile->value == MFX_PROFILE_HEVC_MAIN10 &&
+                if (profile != NULL && profile->value == MFX_PROFILE_HEVC_MAIN10 &&
                     hb_qsv_hardware_generation(hb_qsv_get_platform(hb_qsv_get_adapter_index())) < QSV_G6)
                 {
                     hb_log("qsv: HEVC Main10 is not supported on this platform");
@@ -3490,23 +3475,6 @@ const char* const* hb_qsv_level_get_names(int encoder)
             return hb_qsv_av1_level_names;
         default:
             return NULL;
-    }
-}
-
-const int* hb_qsv_get_pix_fmts(int encoder)
-{
-    switch (encoder)
-    {
-    case HB_VCODEC_FFMPEG_QSV_H264:
-    case HB_VCODEC_FFMPEG_QSV_H265:
-    case HB_VCODEC_FFMPEG_QSV_AV1:
-        return hb_qsv_pix_fmts;
-    case HB_VCODEC_FFMPEG_QSV_H265_10BIT:
-    case HB_VCODEC_FFMPEG_QSV_AV1_10BIT:
-        return hb_qsv_10bit_pix_fmts;
-
-    default:
-        return hb_qsv_pix_fmts;
     }
 }
 
@@ -3667,30 +3635,6 @@ int hb_qsv_param_default(hb_qsv_param_t *param, hb_qsv_info_t *info)
     return 0;
 }
 
-hb_triplet_t* hb_triplet4value(hb_triplet_t *triplets, const int value)
-{
-    for (int i = 0; triplets[i].name != NULL; i++)
-    {
-        if (triplets[i].value == value)
-        {
-            return &triplets[i];
-        }
-    }
-    return NULL;
-}
-
-hb_triplet_t* hb_triplet4name(hb_triplet_t *triplets, const char *name)
-{
-    for (int i = 0; triplets[i].name != NULL; i++)
-    {
-        if (!strcasecmp(triplets[i].name, name))
-        {
-            return &triplets[i];
-        }
-    }
-    return NULL;
-}
-
 hb_triplet_t* hb_triplet4key(hb_triplet_t *triplets, const char *key)
 {
     for (int i = 0; triplets[i].name != NULL; i++)
@@ -3701,47 +3645,6 @@ hb_triplet_t* hb_triplet4key(hb_triplet_t *triplets, const char *key)
         }
     }
     return NULL;
-}
-
-const char* hb_qsv_codec_name(uint32_t codec_id)
-{
-    switch (codec_id)
-    {
-        case MFX_CODEC_AVC:
-            return "H.264/AVC";
-
-        case MFX_CODEC_HEVC:
-            return "H.265/HEVC";
-
-        case MFX_CODEC_AV1:
-            return "AV1";
-
-        default:
-            return NULL;
-    }
-}
-
-const char* hb_qsv_profile_name(uint32_t codec_id, uint16_t profile_id)
-{
-    hb_triplet_t *profile = NULL;
-    switch (codec_id)
-    {
-        case MFX_CODEC_AVC:
-            profile = hb_triplet4value(hb_qsv_h264_profiles, profile_id);
-            break;
-
-        case MFX_CODEC_HEVC:
-            profile = hb_triplet4value(hb_qsv_h265_profiles, profile_id);
-            break;
-
-        case MFX_CODEC_AV1:
-            profile = hb_triplet4value(hb_qsv_av1_profiles, profile_id);
-            break;
-
-        default:
-            break;
-    }
-    return profile != NULL ? profile->name : NULL;
 }
 
 const char* hb_qsv_impl_get_name(int impl)
@@ -3907,9 +3810,9 @@ hb_hwaccel_t hb_hwaccel_qsv =
     .encoders     = qsv_encoders,
     .type         = AV_HWDEVICE_TYPE_QSV,
     .hw_pix_fmt   = AV_PIX_FMT_QSV,
-    .can_filter   = are_filters_supported,
+    .can_filter   = can_use_full_hw_pipeline,
     .find_decoder = find_decoder,
-    .caps         = HB_HWACCEL_CAP_ROTATE | HB_HWACCEL_CAP_COLOR_RANGE
+    .caps         = HB_HWACCEL_CAP_ROTATE | HB_HWACCEL_CAP_COLOR_RANGE | HB_HWACCEL_CAP_SYSTEM_MEMORY
 };
 
 #else // HB_PROJECT_FEATURE_QSV

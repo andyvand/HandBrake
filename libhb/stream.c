@@ -1067,8 +1067,8 @@ hb_title_t * hb_stream_title_scan(hb_stream_t *stream, hb_title_t * title)
     title->type = HB_STREAM_TYPE;
 
     // Copy part of the stream path to the title name
-    char * name = stream->path;
-    char * sep  = hb_strr_dir_sep(stream->path);
+    const char * name = stream->path;
+    const char * sep  = hb_strr_dir_sep(stream->path);
     if (sep)
         name = sep + 1;
     title->name = strdup(name);
@@ -2745,6 +2745,19 @@ int decode_program_map(hb_stream_t* stream)
     bits_get(&bb, 4);
     unsigned int section_length = bits_get(&bb, 12);
 
+    // Section length must accommodate the sum of
+    // fixed fields + one elementary stream + CRC
+    if (section_length < 18)
+    {
+        return 0;
+    }
+
+    // Bytes read plus section length must not exceed buffer size
+    if (3 + section_length > stream->pmt_info.tablepos)
+    {
+        return 0;
+    }
+
     bits_get(&bb, 16); // program number
     bits_get(&bb, 2);
     bits_get(&bb, 5);  // version_number
@@ -2755,6 +2768,13 @@ int decode_program_map(hb_stream_t* stream)
     stream->pmt_info.PCR_PID = bits_get(&bb, 13);
     bits_get(&bb, 4);
     int program_info_length = bits_get(&bb, 12);
+
+    // Program info length must not exceed remaining section bytes
+    if (program_info_length > (int)(section_length) - 13)
+    {
+        return 0;
+    }
+
     int i;
     for (i = 0; i < program_info_length - 2; )
     {
@@ -2790,11 +2810,24 @@ int decode_program_map(hb_stream_t* stream)
     int ii = 0;
     while (!done_reading_stream_types)
     {
+        // Ensure we do not read past the available bytes remaining
+        if (bits_bytes_left(&bb) < 5 /* stream header */ + 4 /* read-ahead */)
+        {
+            break;
+        }
+
         unsigned char stream_type = bits_get(&bb, 8);
         bits_get(&bb, 3);
         unsigned int elementary_PID = bits_get(&bb, 13);
         bits_get(&bb, 4);
         unsigned int info_len = bits_get(&bb, 12);
+
+        // Stream info length must not exceed remaining section bytes
+        if ((int)(info_len) > (int)(section_length) - cur_pos - 5 /* stream header */ - 4 /* CRC */)
+        {
+            info_len = 0; // ignore truncated descriptor list
+        }
+
         // Defined audio stream types are 0x81 for AC-3/A52 audio
         // and 0x03 for mpeg audio. But content producers seem to
         // use other values (0x04 and 0x06 have both been observed)
@@ -2818,7 +2851,7 @@ int decode_program_map(hb_stream_t* stream)
 
         cur_pos += 5 /* stream header */ + info_len;
 
-        if (cur_pos >= section_length - 4 /* stop before the CRC */)
+        if (cur_pos >= (int)(section_length) - 4 /* stop before the CRC */)
             done_reading_stream_types = 1;
         ii++;
     }
@@ -3689,8 +3722,23 @@ static int update_ps_streams( hb_stream_t * stream, int stream_id, int stream_id
                 // to the end of the list.  we want to keep it for
                 // debug and informational purposes.
                 int jj = new_pes( stream );
-                memcpy( &stream->pes.list[jj], &stream->pes.list[ii],
-                        sizeof( hb_pes_stream_t ) );
+                hb_pes_stream_t *src = &stream->pes.list[ii];
+                hb_pes_stream_t *dst = &stream->pes.list[jj];
+
+                memcpy(dst, src, sizeof(hb_pes_stream_t));
+                if (src->extradata != NULL && src->extradata_size > 0)
+                {
+                    dst->extradata = malloc(src->extradata_size);
+                    if (dst->extradata != NULL)
+                    {
+                        memcpy(dst->extradata, src->extradata, src->extradata_size);
+                    }
+                    else
+                    {
+                        dst->extradata = NULL;
+                        dst->extradata_size = 0;
+                    }
+                }
                 break;
             }
         }
@@ -6039,8 +6087,8 @@ static hb_title_t *ffmpeg_title_scan( hb_stream_t *stream, hb_title_t *title )
     title->type = HB_FF_STREAM_TYPE;
 
     // Copy part of the stream path to the title name
-    char * name = stream->path;
-    char * sep = hb_strr_dir_sep(stream->path);
+    const char * name = stream->path;
+    const char * sep = hb_strr_dir_sep(stream->path);
     if (sep)
         name = sep + 1;
     title->name = strdup(name);
@@ -6160,6 +6208,21 @@ static hb_title_t *ffmpeg_title_scan( hb_stream_t *stream, hb_title_t *title )
                     default:
                         break;
                 }
+            }
+
+            if (codecpar->codec_id == AV_CODEC_ID_H264 &&
+                hb_h264_extradata_has_mvc(codecpar->extradata,
+                                          codecpar->extradata_size))
+            {
+                title->multiview = HB_MULTIVIEW_MVC;
+            }
+
+            // MV-HEVC (e.g. Apple spatial video), the demuxer flags streams
+            // with an 'lhvC' layered HEVC configuration as multilayer
+            if (codecpar->codec_id == AV_CODEC_ID_HEVC &&
+                (st->disposition & AV_DISPOSITION_MULTILAYER))
+            {
+                title->multiview = HB_MULTIVIEW_MVHEVC;
             }
 
             title->video_codec        = WORK_DECAVCODECV;

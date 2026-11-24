@@ -44,7 +44,7 @@
  * HW accel display
  ***********************************************************************/
 #if defined(SYS_LINUX) || defined(SYS_FREEBSD)
-extern const char* DRM_INTEL_DRIVER_NAME;
+extern const char * DRM_INTEL_DRIVER_NAMES[];
 #endif // SYS_LINUX || SYS_FREEBSD
 
 typedef struct
@@ -60,7 +60,7 @@ typedef struct
 #endif
 } hb_display_t;
 
-hb_display_t * hb_display_init(const char         * driver_name,
+hb_display_t * hb_display_init(const char * const * driver_names,
                                const uint32_t       dri_render_node,
                                const char * const * interface_names);
 void           hb_display_close(hb_display_t ** _d);
@@ -134,7 +134,7 @@ struct dirent * hb_readdir(HB_DIR *dir);
 int hb_mkdir(const char *name);
 int hb_stat(const char *path, hb_stat_t *sb);
 FILE * hb_fopen(const char *path, const char *mode);
-char * hb_strr_dir_sep(const char *path);
+const char * hb_strr_dir_sep(const char *path);
 
 /************************************************************************
  * String utils

@@ -426,8 +426,8 @@ static GhbBinding widget_bindings[] =
     {"PictureDetelecine", "active-id", "custom10", "PictureDetelecineCustom", "visible"},
     {"PictureColorspacePreset", "active-id", "custom11", "PictureColorspaceCustom", "visible"},
     {"VideoEncoder", "active-id", "svt_av1|svt_av1_10bit|x264|x264_10bit", "x264FastDecode", "visible"},
-    {"VideoEncoder", "active-id", "svt_av1|svt_av1_10bit|x264|x264_10bit|x265|x265_10bit|x265_12bit|x265_16bit|mpeg4|mpeg2|VP8|VP9|VP9_10bit|qsv_av1|qsv_av1_10bit|qsv_h264|qsv_h265|qsv_h265_10bit|vce_av1|vce_av1_10bit|vce_h264|vce_h265|vce_h265_10bit|vaapi_h264|vaapi_hevc|vaapi_av1|vaapi_vp8|vaapi_vp9", "VideoOptionExtraWindow", "visible"},
-    {"VideoEncoder", "active-id", "svt_av1|svt_av1_10bit|x264|x264_10bit|x265|x265_10bit|x265_12bit|x265_16bit|mpeg4|mpeg2|VP8|VP9|VP9_10bit|qsv_av1|qsv_av1_10bit|qsv_h264|qsv_h265|qsv_h265_10bit|vce_av1|vce_av1_10bit|vce_h264|vce_h265|vce_h265_10bit|vaapi_h264|vaapi_hevc|vaapi_av1|vaapi_vp8|vaapi_vp9", "VideoOptionExtraLabel", "visible"},
+    {"VideoEncoder", "active-id", "svt_av1|svt_av1_10bit|x264|x264_10bit|x265|x265_10bit|x265_12bit|x265_16bit|mpeg4|mpeg2|nvenc_av1|nvenc_av1_10bit|nvenc_h264|nvenc_h264_10bit|nvenc_h265|nvenc_h265_10bit|VP8|VP9|VP9_10bit|qsv_av1|qsv_av1_10bit|qsv_h264|qsv_h265|qsv_h265_10bit|vce_av1|vce_av1_10bit|vce_h264|vce_h265|vce_h265_10bit|vaapi_h264|vaapi_hevc|vaapi_av1|vaapi_vp8|vaapi_vp9", "VideoOptionExtraWindow", "visible"},
+    {"VideoEncoder", "active-id", "svt_av1|svt_av1_10bit|x264|x264_10bit|x265|x265_10bit|x265_12bit|x265_16bit|mpeg4|mpeg2|nvenc_av1|nvenc_av1_10bit|nvenc_h264|nvenc_h264_10bit|nvenc_h265|nvenc_h265_10bit|VP8|VP9|VP9_10bit|qsv_av1|qsv_av1_10bit|qsv_h264|qsv_h265|qsv_h265_10bit|vce_av1|vce_av1_10bit|vce_h264|vce_h265|vce_h265_10bit|vaapi_h264|vaapi_hevc|vaapi_av1|vaapi_vp8|vaapi_vp9", "VideoOptionExtraLabel", "visible"},
     {"auto_name", "active", NULL, "autoname_box", "sensitive"},
     {"CustomTmpEnable", "active", NULL, "CustomTmpDir", "sensitive"},
     {"PresetCategory", "active-id", "new", "PresetCategoryName", "visible"},
@@ -5304,6 +5304,50 @@ ui_language_changed_cb (GtkWidget *widget, gpointer data)
 {
     pref_changed_cb(widget, ghb_ud());
     prefs_require_restart = TRUE;
+}
+
+void
+ghb_check_custom_temp_dir(const char *directory)
+{
+    const char *message;
+
+    if (directory == NULL || directory[0] == '\0')
+        return;
+
+    if (!g_file_test(directory, G_FILE_TEST_IS_DIR))
+    {
+        message = _("“%s” is not a valid directory.\n\n"
+                    "Open Preferences to select another directory, or choose Reset and Quit "
+                    "to use the default temporary directory on the next launch.");
+    }
+    else if (g_access(directory, R_OK|W_OK) != 0)
+    {
+        message = _("“%s” is not a writable directory.\n\n"
+                    "Open Preferences to select another directory, or choose Reset and Quit "
+                    "to use the default temporary directory on the next launch.");
+    }
+    else
+    {
+        return;
+    }
+
+    if (ghb_question_dialog_run(NULL, GHB_ACTION_SUGGESTED,
+            _("_Open Preferences"), _("_Reset and Quit"),
+            _("Custom Temporary Directory Unavailable"), message, directory))
+    {
+        g_action_group_activate_action(G_ACTION_GROUP(g_application_get_default()),
+                                       "preferences", NULL);
+        gtk_stack_set_visible_child(GTK_STACK(ghb_builder_widget("prefs_stack")),
+                                   ghb_builder_widget("vbox1"));
+    }
+    else
+    {
+        gtk_check_button_set_active(
+            GTK_CHECK_BUTTON(ghb_builder_widget("CustomTmpEnable")), FALSE);
+        ghb_prefs_store();
+        g_action_group_activate_action(G_ACTION_GROUP(g_application_get_default()),
+                                       "quit", NULL);
+    }
 }
 
 G_MODULE_EXPORT void

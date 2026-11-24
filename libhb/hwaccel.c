@@ -224,6 +224,12 @@ enum AVPixelFormat hw_hwaccel_get_hw_format(AVCodecContext *ctx, const enum AVPi
     const hb_job_t *job = ctx->opaque;
     const enum AVPixelFormat *p;
 
+    if (job && job->hw_pix_fmt == AV_PIX_FMT_NONE &&
+        (job->hw_accel->caps & HB_HWACCEL_CAP_SYSTEM_MEMORY))
+    {
+        return ctx->sw_pix_fmt;
+    }
+
     for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++)
     {
         if (job && job->hw_pix_fmt != AV_PIX_FMT_NONE)
@@ -252,9 +258,26 @@ int hb_hwaccel_hw_device_ctx_init(enum AVHWDeviceType device_type, int device_in
 
     if (device_index > -1)
     {
-        char device[32];
-        snprintf(device, 32, "%u", device_index);
-        av_dict_set(&dict, "child_device", device, 0);
+        char device[32] = "";
+#if HB_PROJECT_FEATURE_QSV && (defined(SYS_LINUX) || defined(SYS_FREEBSD))
+        // The VAAPI child device wants a DRM node path, not an index
+        if (device_type == AV_HWDEVICE_TYPE_QSV)
+        {
+            int render_node = hb_qsv_get_adapter_render_node(device_index);
+            if (render_node > 0)
+            {
+                snprintf(device, 32, "/dev/dri/renderD%d", render_node);
+            }
+        }
+        else
+#endif
+        {
+            snprintf(device, 32, "%u", device_index);
+        }
+        if (device[0])
+        {
+            av_dict_set(&dict, "child_device", device, 0);
+        }
     }
 
 #if defined(_WIN32) || defined(__MINGW32__)
@@ -338,8 +361,6 @@ int hb_hwaccel_hwframes_ctx_init(AVCodecContext *ctx,
 #if HB_PROJECT_FEATURE_QSV
     if (hw_pix_fmt == AV_PIX_FMT_QSV)
     {
-        frames_ctx->initial_pool_size = HB_QSV_FFMPEG_INITIAL_POOL_SIZE;
-
         AVQSVFramesContext *frames_hwctx = frames_ctx->hwctx;
         frames_hwctx->frame_type = MFX_MEMTYPE_VIDEO_MEMORY_DECODER_TARGET;
     }
