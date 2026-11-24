@@ -1327,9 +1327,8 @@ foreach(candidate "${PROJECT_SOURCE_DIR}/dlssnr-logical.safetensors" "${NR_WORK_
     set(nr_prepare_source --weights "${candidate}")
   endif()
 endforeach()
-# Only where the command exists: a build without libpng (a cross build whose host
-# libpng cannot link, say) has no nr_frame_cli, and a target that names one fails
-# at generate time.
+# Only with the command, which needs libpng: a cross build without one for its target failed
+# to configure here.
 if(TARGET nr_frame_cli)
   add_custom_target(prepare_weights
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${NR_WORK_DIR}/mlxw"
